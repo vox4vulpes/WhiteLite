@@ -1,5 +1,7 @@
 # WhiteLite
 
+**Status: Alpha.** Actively evolving, run in production at your own risk.
+
 Self-hosted OpenVPN + Telegram bot, with a WebRTC-based fallback tunnel (via
 [olcRTC](https://github.com/openlibrecommunity/olcrtc)) for when a provider
 whitelists only "legitimate" video-call services (Jitsi/Telemost/WbStream) and
@@ -32,6 +34,16 @@ Inspired by the write-up at https://www.pvsm.ru/vpn/449328.
   (placement in each test counts as points; the speed test is weighted 2x).
 - Add `-test` to any `-best_*` flag to see the scan results without deploying
   a tunnel.
+- Add `-checkoff` to any `-best_*` scan (or `/whitesub -setup`) to skip the
+  real anonymous-XMPP-login check (see below) for a faster but less reliable
+  scan.
+- `/whitesub -setup [N]` — runs both scans, shows the full ranked list, and
+  waits for a reply with the position numbers you've manually confirmed work
+  on your network; saves the best N of those as a pool (default N=5), without
+  deploying anything yet.
+- `/whitesub [N]` — deploys N tunnels from that saved pool and immediately
+  sends a `sub.md`-format subscription file (importable in olcbox: add
+  configuration → import from file).
 - `/list` — every client ever issued (OpenVPN certs + live White/Jitsi
   containers), sorted by traffic/activity within each group.
 - `/monitor` — OpenVPN bandwidth and connected-client stats.
@@ -39,7 +51,24 @@ Inspired by the write-up at https://www.pvsm.ru/vpn/449328.
   get its config re-sent; reply to that message to give it a friendly name
   shown in `/list`.
 
-Admin-only commands (`/white`, `/list`) are gated by `ADMIN_TELEGRAM_ID`.
+Admin-only commands (`/white`, `/list`, `/whitesub`) are gated by
+`ADMIN_TELEGRAM_ID`.
+
+### Candidate filtering for `-best_*` scans
+
+The public Jitsi server list used by the scans includes hosts that pass a
+plain HTTP reachability check but don't actually work as an olcRTC tunnel
+(bare IPs with no TLS SAN, misconfigured/expired domains with a mismatched
+cert, servers with anonymous XMPP login disabled, etc.). Every scan therefore:
+
+1. drops bare IPs (can't pass TLS hostname verification),
+2. drops hosts on a persisted denylist (`bot-data/jitsi_denylist.json`),
+3. by default, actually spins up the real `olcrtc` binary against each
+   remaining candidate for a few seconds to confirm it can join the room —
+   any host that fails is added to the denylist automatically, so future
+   scans skip it for free.
+
+Step 3 is what `-checkoff` disables.
 
 ## Setup
 
@@ -77,8 +106,9 @@ Admin-only commands (`/white`, `/list`) are gated by `ADMIN_TELEGRAM_ID`.
 ## Data persistence
 
 The bot stores its own state (client name aliases, White-tunnel metadata,
-default Jitsi server) under `/data` inside the container, backed by the
-`./bot-data` volume — keep it around across rebuilds/restarts.
+default Jitsi server, the Jitsi denylist, the `/whitesub -setup` pool) under
+`/data` inside the container, backed by the `./bot-data` volume — keep it
+around across rebuilds/restarts.
 
 ## Security notes
 

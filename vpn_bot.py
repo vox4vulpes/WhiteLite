@@ -43,17 +43,32 @@ JITSI_SPEED_WORKERS = 8             # конкурентность для speed-
 
 TELEGRAM_MSG_LIMIT = 3500  # запас от лимита телеграма в 4096 символов на сообщение
 
-KNOWN_WHITE_FLAGS = {"-best_ms", "-best_mb", "-best_all", "-test", "-default"}
+KNOWN_WHITE_FLAGS = {"-best_ms", "-best_mb", "-best_all", "-test", "-default", "-checkoff"}
 
 DATA_DIR = "/data"  # смонтирован как volume, переживает пересборку/рестарт бота
 CLIENT_NAMES_FILE = os.path.join(DATA_DIR, "client_names.json")   # {real_name: alias}
 WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_name: {...}}
 DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
+WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [...], "updated_at": ts}
+JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
+
+# Заведённые вручную по факту обнаруженной поломки: проходят HTTP-пробу (латенси/скорость),
+# но реально не работают как jitsi-провайдер для olcrtc. Дозаполняется по мере находок.
+SEED_JITSI_DENYLIST = [
+    "meet.astrocard-iservice.com",  # "server does not advertise anonymous XMPP login"
+]
+
+WHITESUB_DEFAULT_COUNT = 5
+WHITESUB_MAX_COUNT = 20  # разумный потолок, чтобы не наплодить контейнеров по ошибке
 
 # message_id сообщения с конфигом -> real_name, для обработки ответа-переименования.
 # Живёт только в памяти процесса: если бот перезапустится до ответа - просто
 # отвалится возможность переименовать именно то сообщение, не критично.
 pending_rename = {}
+
+# message_id сообщения-запроса /whitesub -setup -> {"combined": [...], "count": N}.
+# Тоже только в памяти - если бот перезапустится до ответа, придётся запускать -setup заново.
+pending_whitesub_setup = {}
 
 
 def is_admin(message):
@@ -94,6 +109,29 @@ def save_white_config(container_name, data):
     configs = get_white_configs()
     configs[container_name] = data
     save_json_file(WHITE_CONFIGS_FILE, configs)
+
+
+def get_whitesub_pool():
+    return load_json_file(WHITESUB_POOL_FILE, {}).get("hosts", [])
+
+
+def save_whitesub_pool(hosts):
+    save_json_file(WHITESUB_POOL_FILE, {"hosts": hosts, "updated_at": time.time()})
+
+
+def get_jitsi_denylist():
+    data = load_json_file(JITSI_DENYLIST_FILE, None)
+    if data is None:
+        save_json_file(JITSI_DENYLIST_FILE, {"hosts": SEED_JITSI_DENYLIST})
+        return list(SEED_JITSI_DENYLIST)
+    return data.get("hosts", [])
+
+
+def add_to_jitsi_denylist(host):
+    hosts = get_jitsi_denylist()
+    if host not in hosts:
+        hosts.append(host)
+        save_json_file(JITSI_DENYLIST_FILE, {"hosts": hosts})
 
 
 def get_default_jitsi_instance():
@@ -147,17 +185,80 @@ def is_bare_ip(host):
         return False
 
 
-def fetch_jitsi_candidates():
-    """Тянет список кандидатов, отбрасывая голые IP: реальный Jitsi-коннект идёт
-    через TLS с проверкой сертификата по hostname/SNI, а у сертификата нет IP SAN'ов,
-    поэтому такие хосты проходят HTTP-пробы, но никогда не работают как туннель."""
+JITSI_ANON_CHECK_TIMEOUT = 4   # сек: если процесс не упал раньше - анонимный вход прошёл
+JITSI_ANON_CHECK_WORKERS = 8   # конкурентность, без фанатизма
+
+
+def check_jitsi_anonymous_login(host):
+    """Реально пробует зайти в комнату через настоящий olcrtc (образ olcrtc-server:latest) -
+    это ловит случаи вроде 'server does not advertise anonymous XMPP login', которые не видны
+    через обычный HTTP GET. Если анонимный вход проходит, процесс успешно джойнится и висит,
+    ожидая клиента (не завершается сам) - поэтому упирается в таймаут, и это сигнал "работает".
+    Если он падает раньше таймаута - что-то не так (в т.ч. анонимный логин недоступен)."""
+    container_name = f"olcrtc-probe-{uuid.uuid4().hex[:8]}"
+    room_id = f"https://{host}/probe-{uuid.uuid4().hex[:8]}"
+    enc_key = os.urandom(32).hex()
+
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--name", container_name,
+                "--network", "host",
+                "-e", f"ROOM_ID={room_id}",
+                "-e", f"ENC_KEY={enc_key}",
+                "-e", "PROVIDER=jitsi",
+                "-e", "TRANSPORT=datachannel",
+                OLCRTC_IMAGE,
+            ],
+            capture_output=True, text=True, timeout=JITSI_ANON_CHECK_TIMEOUT,
+        )
+        return False  # завершился раньше времени сам - что-то не так
+    except subprocess.TimeoutExpired:
+        return True
+    except Exception:
+        return False
+    finally:
+        subprocess.run(["docker", "kill", container_name], capture_output=True, text=True)
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+
+
+def filter_by_anonymous_login(hosts):
+    """Прогоняет кандидатов через check_jitsi_anonymous_login параллельно, отсекая тех,
+    кто не проходит реальный XMPP/MUC-джойн (проходят HTTP-пробы, но не годятся для туннеля).
+    Провалившихся хостов сразу помечает как проблемные (denylist) - в следующий раз их уже
+    не нужно будет перепроверять этой дорогой проверкой, они отсеются на дешёвом этапе."""
+    good = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_ANON_CHECK_WORKERS) as pool:
+        futures = {pool.submit(check_jitsi_anonymous_login, h): h for h in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            host = futures[future]
+            if future.result():
+                good.append(host)
+            else:
+                add_to_jitsi_denylist(host)
+    return good
+
+
+def fetch_jitsi_candidates(check_anonymous_login=True):
+    """Тянет список кандидатов, отбрасывая голые IP и хосты из denylist. Если
+    check_anonymous_login=True (по умолчанию), дополнительно прогоняет реальную проверку
+    анонимного XMPP-логина (check_jitsi_anonymous_login) - её можно отключить флагом
+    -checkoff, если нужен быстрый скан без этой дорогой проверки.
+    Голые IP: реальный Jitsi-коннект идёт через TLS с проверкой сертификата по
+    hostname/SNI, а у сертификата нет IP SAN'ов - такие хосты проходят HTTP-пробы,
+    но никогда не работают как туннель. Denylist - хосты, провалившие check_jitsi_anonymous_login
+    ранее (помечаются туда автоматически) или добавленные вручную."""
     resp = requests.get(JITSI_LIST_URL, timeout=10)
     resp.raise_for_status()
+    denylist = set(get_jitsi_denylist())
     hosts = []
     for line in resp.text.splitlines():
         line = line.strip()
-        if line and not line.startswith('#') and not is_bare_ip(line):
+        if line and not line.startswith('#') and not is_bare_ip(line) and line not in denylist:
             hosts.append(line)
+    if check_anonymous_login:
+        hosts = filter_by_anonymous_login(hosts)
     return hosts
 
 
@@ -173,11 +274,11 @@ def probe_jitsi_host(host):
         return host, time.monotonic() - start, str(e)
 
 
-def scan_best_jitsi(progress_cb, hosts=None):
+def scan_best_jitsi(progress_cb, hosts=None, check_anonymous_login=True):
     """Пробегается по списку кандидатов, отчитывается через progress_cb(done, total, found).
     Если hosts не передан, тянет список сам (для одиночного вызова -best_ms)."""
     if hosts is None:
-        hosts = fetch_jitsi_candidates()
+        hosts = fetch_jitsi_candidates(check_anonymous_login=check_anonymous_login)
     total = len(hosts)
     results = []
     done = 0
@@ -247,11 +348,11 @@ def probe_jitsi_speed(host):
     return host, mbps, None
 
 
-def scan_best_long_jitsi(progress_cb, hosts=None):
+def scan_best_long_jitsi(progress_cb, hosts=None, check_anonymous_login=True):
     """Как scan_best_jitsi, но ранжирует по реальной скорости скачивания (Mbps, >=20МБ на хост), не по задержке.
     Если hosts не передан, тянет список сам (для одиночного вызова -best_mb)."""
     if hosts is None:
-        hosts = fetch_jitsi_candidates()
+        hosts = fetch_jitsi_candidates(check_anonymous_login=check_anonymous_login)
     total = len(hosts)
     results = []
     done = 0
@@ -282,10 +383,13 @@ def handle_start(message):
         "*/white* `-best_mb` — то же самое, но выбор по реальной скорости скачивания (Mbps, тест на 20+ МБ), а не по задержке — дольше, но точнее\n"
         "*/white* `-best_all` — проводит оба теста и считает комбинированный балл по местам в каждом (1 место = -1 балл, N место = -N баллов, старт у всех N+1; место по скорости считается с двойным весом)\n"
         "  добавь `-test` к любому из `-best_ms` / `-best_mb` / `-best_all` (например `/white -best_ms -test`), чтобы только увидеть результаты скана без подъёма туннеля\n"
+        "  добавь `-checkoff`, чтобы отключить реальную проверку анонимного XMPP-логина (быстрее, но без гарантии, что домен реально годится для туннеля)\n"
         "*/white* `-default <домен>` — задать домен по умолчанию для обычного `/white` (например `/white -default meet.small-dm.ru`)\n"
         "*/monitor* — статистика клиентов и загрузка канала\n"
         "*/list* — список всех клиентов: OpenVPN и White отдельно, внутри групп по убыванию трафика/активности\n"
         "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
+        "*/whitesub* `-setup [N]` — прогоняет оба скана (как `-best_all -test`), присылает полный список и ждёт от тебя номера позиций, которые реально работают в твоей сети — ответь на сообщение-приглашение номерами через запятую/пробел, сохранит лучшие N из подтверждённых как пул (по умолчанию N=5), туннели пока не поднимает; добавь `-checkoff`, чтобы пропустить проверку анонимного XMPP-логина\n"
+        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5) и сразу присылает файл подписки (для импорта в olcbox: добавление конфигурации → импорт из файла)\n"
         "*/start* — показать это сообщение",
         parse_mode="Markdown"
     )
@@ -333,54 +437,68 @@ def handle_new_vpn(message):
         bot.edit_message_text(f"❌ Ошибка при генерации: {str(e)}", message.chat.id, msg.message_id)
 
 
+def create_white_tunnel(jitsi_instance, source="white"):
+    """Создаёт один white-туннель: контейнер + сохранённые метаданные.
+    source помечает происхождение (обычный /white vs группа /whitesub -setup),
+    чтобы потом можно было выгрузить именно свою группу профилей.
+    Бросает исключение при ошибке - вызывающий код решает, как её показать."""
+    room_id = f"https://{jitsi_instance}/olcrtc-{uuid.uuid4().hex[:10]}"
+    enc_key = os.urandom(32).hex()
+    container_name = f"olcrtc-{uuid.uuid4().hex[:8]}"
+
+    subprocess.run([
+        "docker", "run", "-d",
+        "--name", container_name,
+        "--network", "host",
+        "--restart", "unless-stopped",
+        "-e", f"ROOM_ID={room_id}",
+        "-e", f"ENC_KEY={enc_key}",
+        "-e", "PROVIDER=jitsi",
+        "-e", "TRANSPORT=datachannel",
+        OLCRTC_IMAGE,
+    ], check=True, capture_output=True, text=True)
+
+    uri = f"olcrtc://jitsi?datachannel@{room_id}#{enc_key}${container_name}"
+
+    save_white_config(container_name, {
+        "jitsi_instance": jitsi_instance,
+        "room_id": room_id,
+        "enc_key": enc_key,
+        "uri": uri,
+        "created_at": time.time(),
+        "source": source,
+    })
+    return container_name, room_id, uri
+
+
+def announce_white_tunnel(chat_id, jitsi_instance, container_name, room_id, uri):
+    """Шлёт QR+инфо для уже созданного туннеля и регистрирует его для переименования по reply."""
+    qr_buf = BytesIO()
+    qrcode.make(uri).save(qr_buf, format="PNG")
+    qr_buf.seek(0)
+
+    sent = bot.send_photo(
+        chat_id,
+        qr_buf,
+        caption=(
+            "✅ Белый конфиг готов\n"
+            f"🌐 Jitsi: `{jitsi_instance}`\n"
+            f"🏷 Контейнер: `{container_name}`\n"
+            f"🚪 Комната: `{room_id}`\n\n"
+            "Импортируй QR в olcbox (Android) или используй строку:\n"
+            f"`{uri}`\n\n"
+            "Скачать olcbox: https://github.com/alananisimov/olcbox/releases/latest\n\n"
+            "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
+        ),
+        parse_mode="Markdown"
+    )
+    pending_rename[sent.message_id] = container_name
+
+
 def deploy_white_tunnel(chat_id, status_message_id, jitsi_instance):
     try:
-        room_id = f"https://{jitsi_instance}/olcrtc-{uuid.uuid4().hex[:10]}"
-        enc_key = os.urandom(32).hex()
-        container_name = f"olcrtc-{uuid.uuid4().hex[:8]}"
-
-        subprocess.run([
-            "docker", "run", "-d",
-            "--name", container_name,
-            "--network", "host",
-            "--restart", "unless-stopped",
-            "-e", f"ROOM_ID={room_id}",
-            "-e", f"ENC_KEY={enc_key}",
-            "-e", "PROVIDER=jitsi",
-            "-e", "TRANSPORT=datachannel",
-            OLCRTC_IMAGE,
-        ], check=True, capture_output=True, text=True)
-
-        uri = f"olcrtc://jitsi?datachannel@{room_id}#{enc_key}${container_name}"
-
-        save_white_config(container_name, {
-            "jitsi_instance": jitsi_instance,
-            "room_id": room_id,
-            "enc_key": enc_key,
-            "uri": uri,
-            "created_at": time.time(),
-        })
-
-        qr_buf = BytesIO()
-        qrcode.make(uri).save(qr_buf, format="PNG")
-        qr_buf.seek(0)
-
-        sent = bot.send_photo(
-            chat_id,
-            qr_buf,
-            caption=(
-                "✅ Белый конфиг готов\n"
-                f"🌐 Jitsi: `{jitsi_instance}`\n"
-                f"🏷 Контейнер: `{container_name}`\n"
-                f"🚪 Комната: `{room_id}`\n\n"
-                "Импортируй QR в olcbox (Android) или используй строку:\n"
-                f"`{uri}`\n\n"
-                "Скачать olcbox: https://github.com/alananisimov/olcbox/releases/latest\n\n"
-                "Ответь на это сообщение текстом, чтобы задать имя, видимое в /list."
-            ),
-            parse_mode="Markdown"
-        )
-        pending_rename[sent.message_id] = container_name
+        container_name, room_id, uri = create_white_tunnel(jitsi_instance)
+        announce_white_tunnel(chat_id, jitsi_instance, container_name, room_id, uri)
         bot.delete_message(chat_id, status_message_id)
 
     except subprocess.CalledProcessError as e:
@@ -410,17 +528,18 @@ def handle_white(message):
         return
 
     dry_run = "-test" in flags
+    check_anonymous_login = "-checkoff" not in flags
 
     if "-best_ms" in flags:
-        handle_white_best(message, dry_run=dry_run)
+        handle_white_best(message, dry_run=dry_run, check_anonymous_login=check_anonymous_login)
         return
 
     if "-best_mb" in flags:
-        handle_white_best_long(message, dry_run=dry_run)
+        handle_white_best_long(message, dry_run=dry_run, check_anonymous_login=check_anonymous_login)
         return
 
     if "-best_all" in flags:
-        handle_white_best_all(message, dry_run=dry_run)
+        handle_white_best_all(message, dry_run=dry_run, check_anonymous_login=check_anonymous_login)
         return
 
     if "-default" in flags:
@@ -437,6 +556,10 @@ def handle_white(message):
 
     if dry_run:
         bot.reply_to(message, "⛔ -test работает только вместе с -best_ms, -best_mb или -best_all.")
+        return
+
+    if not check_anonymous_login:
+        bot.reply_to(message, "⛔ -checkoff работает только вместе с -best_ms, -best_mb или -best_all.")
         return
 
     if non_flags:
@@ -504,7 +627,7 @@ def format_combined_results_list(combined):
     return "\n".join(lines)
 
 
-def handle_white_best(message, dry_run=False):
+def handle_white_best(message, dry_run=False, check_anonymous_login=True):
     msg = bot.reply_to(message, "🔍 Получаю список Jitsi-серверов...")
     last_edit = {"t": 0.0}
 
@@ -522,7 +645,7 @@ def handle_white_best(message, dry_run=False):
             pass  # skip flood-control edit errors, not critical
 
     try:
-        results, total = scan_best_jitsi(progress_cb)
+        results, total = scan_best_jitsi(progress_cb, check_anonymous_login=check_anonymous_login)
     except Exception as e:
         bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
         return
@@ -552,7 +675,7 @@ def handle_white_best(message, dry_run=False):
         deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
 
 
-def handle_white_best_long(message, dry_run=False):
+def handle_white_best_long(message, dry_run=False, check_anonymous_login=True):
     msg = bot.reply_to(message, "🚀 Получаю список Jitsi-серверов (тест на 20+ МБ на хост, может занять пару минут)...")
     last_edit = {"t": 0.0}
 
@@ -570,7 +693,7 @@ def handle_white_best_long(message, dry_run=False):
             pass  # skip flood-control edit errors, not critical
 
     try:
-        results, total = scan_best_long_jitsi(progress_cb)
+        results, total = scan_best_long_jitsi(progress_cb, check_anonymous_login=check_anonymous_login)
     except Exception as e:
         bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
         return
@@ -601,12 +724,12 @@ def handle_white_best_long(message, dry_run=False):
         deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
 
 
-def handle_white_best_all(message, dry_run=False):
+def handle_white_best_all(message, dry_run=False, check_anonymous_login=True):
     msg = bot.reply_to(message, "🧮 Получаю список Jitsi-серверов (оба теста, займёт пару минут)...")
     last_edit = {"t": 0.0}
 
     try:
-        hosts = fetch_jitsi_candidates()
+        hosts = fetch_jitsi_candidates(check_anonymous_login=check_anonymous_login)
     except Exception as e:
         bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
         return
@@ -663,6 +786,214 @@ def handle_white_best_all(message, dry_run=False):
 
     if not dry_run:
         deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
+
+
+@bot.message_handler(commands=['whitesub'])
+def handle_whitesub(message):
+    if not is_admin(message):
+        bot.reply_to(message, "⛔ Команда доступна только администратору.")
+        return
+
+    tokens = message.text.split()[1:]
+    flags = {t for t in tokens if t.startswith('-')}
+    numbers = [t for t in tokens if not t.startswith('-')]
+
+    unknown = flags - {"-setup", "-checkoff"}
+    if unknown:
+        bot.reply_to(message, f"⛔ Неизвестный аргумент: {', '.join(sorted(unknown))}")
+        return
+
+    if "-checkoff" in flags and "-setup" not in flags:
+        bot.reply_to(message, "⛔ -checkoff работает только вместе с -setup.")
+        return
+
+    count = WHITESUB_DEFAULT_COUNT
+    if numbers:
+        try:
+            count = int(numbers[0])
+        except ValueError:
+            bot.reply_to(message, "⛔ N должно быть числом, например `/whitesub 10`.", parse_mode="Markdown")
+            return
+
+    if not (1 <= count <= WHITESUB_MAX_COUNT):
+        bot.reply_to(message, f"⛔ N должно быть от 1 до {WHITESUB_MAX_COUNT}.")
+        return
+
+    if "-setup" in flags:
+        check_anonymous_login = "-checkoff" not in flags
+        handle_whitesub_setup(message, count, check_anonymous_login=check_anonymous_login)
+        return
+
+    handle_whitesub_deploy(message, count)
+
+
+def build_whitesub_text(entries, subscription_name="WhiteLite"):
+    """entries: список (container_name, cfg). Формат совпадает с sub.md из olcRTC -
+    plain text с #-глобальными полями и ##-локальными полями под каждым olcrtc://."""
+    names_map = get_client_names()
+    lines = [f"#name: {subscription_name}", f"#update: {int(time.time())}"]
+    for container_name, cfg in entries:
+        alias = names_map.get(container_name)
+        label = alias if alias else container_name
+        lines.append("")
+        lines.append(cfg["uri"])
+        lines.append(f"##name: {label}")
+    return "\n".join(lines)
+
+
+def handle_whitesub_deploy(message, count):
+    pool = get_whitesub_pool()
+    if not pool:
+        bot.reply_to(
+            message,
+            "❌ Пул пуст. Сначала запусти `/whitesub -setup [N]` и подтверди рабочие позиции.",
+            parse_mode="Markdown"
+        )
+        return
+
+    hosts = pool[:count]
+    note = f" (в пуле только {len(pool)}, поднимаю все)" if count > len(pool) else ""
+
+    status = bot.reply_to(message, f"⏳ Поднимаю {len(hosts)} туннелей из пула{note}...")
+
+    entries = []
+    failed = []
+    for host in hosts:
+        try:
+            container_name, room_id, uri = create_white_tunnel(host, source="whitesub")
+            announce_white_tunnel(message.chat.id, host, container_name, room_id, uri)
+            entries.append((container_name, {"uri": uri}))
+        except Exception as e:
+            failed.append((host, str(e)))
+
+    summary = [f"✅ Поднято: {len(entries)}/{len(hosts)}"]
+    if failed:
+        summary.append("❌ Ошибки:")
+        for host, err in failed:
+            summary.append(f"  `{host}`: {err}")
+    bot.edit_message_text("\n".join(summary), message.chat.id, status.message_id, parse_mode="Markdown")
+
+    if entries:
+        text = build_whitesub_text(entries)
+        file_buf = BytesIO(text.encode("utf-8"))
+        file_buf.name = "whitesub.txt"
+        bot.send_document(
+            message.chat.id,
+            file_buf,
+            caption=(
+                f"📦 Подписка из {len(entries)} профилей\n"
+                "Импортируй файл в olcbox: добавление конфигурации → импорт из файла."
+            )
+        )
+
+
+def handle_whitesub_setup(message, count, check_anonymous_login=True):
+    msg = bot.reply_to(
+        message,
+        f"🧮 Получаю список Jitsi-серверов (оба теста, займёт пару минут)... Цель: {count} рабочих подключений."
+    )
+    last_edit = {"t": 0.0}
+
+    try:
+        hosts = fetch_jitsi_candidates(check_anonymous_login=check_anonymous_login)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", message.chat.id, msg.message_id)
+        return
+
+    def make_progress_cb(stage_label):
+        def progress_cb(done, total, found):
+            now = time.monotonic()
+            if done != total and now - last_edit["t"] < JITSI_SCAN_PROGRESS_MIN_INTERVAL:
+                return
+            last_edit["t"] = now
+            try:
+                bot.edit_message_text(
+                    f"🧮 {stage_label}: {done}/{total} (осталось {total - done}), рабочих найдено: {found}",
+                    message.chat.id, msg.message_id
+                )
+            except Exception:
+                pass
+        return progress_cb
+
+    try:
+        latency_results, total = scan_best_jitsi(make_progress_cb("Этап 1/2, задержка"), hosts=hosts)
+        speed_results, _ = scan_best_long_jitsi(make_progress_cb("Этап 2/2, скорость"), hosts=hosts)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка во время сканирования: {e}", message.chat.id, msg.message_id)
+        return
+
+    if not latency_results and not speed_results:
+        bot.edit_message_text(
+            f"❌ Просканировано {total} серверов, ни один не ответил ни в одном из тестов.",
+            message.chat.id, msg.message_id
+        )
+        return
+
+    combined = compute_combined_scores(hosts, latency_results, speed_results)
+
+    bot.edit_message_text(
+        f"✅ Просканировано {total}. Полный список - следующим сообщением.\n"
+        "Открой несколько вручную (браузером/телефоном в своей сети) и ответь "
+        "на сообщение-приглашение ниже номерами позиций, которые реально работают "
+        f"(например: 1, 3, 7, 12). Возьму лучшие {count} из подтверждённых.",
+        message.chat.id, msg.message_id, parse_mode="Markdown"
+    )
+
+    send_long_message(
+        message.chat.id,
+        "📋 *Полный список (комбинированный балл):*\n" + format_combined_results_list(combined),
+        parse_mode="Markdown"
+    )
+
+    prompt = bot.send_message(
+        message.chat.id,
+        f"👉 Ответь НА ЭТО сообщение номерами позиций из списка выше, которые ты проверил "
+        f"и они реально работают (через запятую или пробел). Возьму лучшие {count} из них."
+    )
+    pending_whitesub_setup[prompt.message_id] = {
+        "combined": combined,
+        "count": count,
+    }
+
+
+def process_whitesub_setup_reply(message, reply_id):
+    data = pending_whitesub_setup.pop(reply_id)
+    combined = data["combined"]
+    count = data["count"]
+    total = len(combined)
+
+    positions = []
+    for tok in re.findall(r'\d+', message.text):
+        n = int(tok)
+        if n not in positions:
+            positions.append(n)
+
+    valid_positions = sorted(p for p in positions if 1 <= p <= total)
+    invalid_positions = [p for p in positions if p not in valid_positions]
+
+    if not valid_positions:
+        bot.reply_to(
+            message,
+            "⛔ Не нашёл ни одной валидной позиции в ответе. Пришли номера из списка (например: 1, 3, 7)."
+        )
+        return
+
+    chosen_positions = valid_positions[:count]
+    skipped_over_limit = valid_positions[count:]
+    hosts = [combined[p - 1][0] for p in chosen_positions]
+
+    save_whitesub_pool(hosts)
+
+    summary_lines = [
+        f"✅ Пул из {len(hosts)} доменов сохранён (позиции: {', '.join(f'#{p}' for p in chosen_positions)}).",
+        "Используй `/whitesub [N]`, чтобы поднять N туннелей из пула и сразу получить файл подписки.",
+    ]
+    if invalid_positions:
+        summary_lines.append(f"⚠️ Проигнорированы неверные позиции: {', '.join(map(str, invalid_positions))}")
+    if skipped_over_limit:
+        summary_lines.append(f"ℹ️ Позиции сверх лимита {count}: {', '.join(map(str, skipped_over_limit))}")
+
+    bot.reply_to(message, "\n".join(summary_lines), parse_mode="Markdown")
 
 
 def parse_status():
@@ -1052,12 +1383,19 @@ def handle_text(message):
     try:
         text = message.text.strip()
 
-        if message.reply_to_message and message.reply_to_message.message_id in pending_rename:
-            key = pending_rename.pop(message.reply_to_message.message_id)
-            alias = sanitize_alias(text)
-            set_client_name(key, alias)
-            bot.reply_to(message, f"✅ Имя для `{key}` обновлено: {alias}", parse_mode="Markdown")
-            return
+        if message.reply_to_message:
+            reply_id = message.reply_to_message.message_id
+
+            if reply_id in pending_whitesub_setup:
+                process_whitesub_setup_reply(message, reply_id)
+                return
+
+            if reply_id in pending_rename:
+                key = pending_rename.pop(reply_id)
+                alias = sanitize_alias(text)
+                set_client_name(key, alias)
+                bot.reply_to(message, f"✅ Имя для `{key}` обновлено: {alias}", parse_mode="Markdown")
+                return
 
         key = resolve_client_key(text)
         if key is None:
