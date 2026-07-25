@@ -174,6 +174,9 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
     Любой другой путь или неверный токен - 404, чтобы не подсказывать сканерам,
     что путь вообще существует."""
 
+    protocol_version = "HTTP/1.1"  # длина тела всегда явная (Content-Length),
+    # а не полагается на "конец = закрытие соединения" как в HTTP/1.0
+
     def do_GET(self):
         token = get_whitesub_token()
         if self.path != f"/sub/{token}":
@@ -198,9 +201,21 @@ class SubscriptionRequestHandler(BaseHTTPRequestHandler):
         pass  # не шумим в логи бота на случайные сканы порта
 
 
+class SubscriptionHTTPSServer(ThreadingHTTPServer):
+    def shutdown_request(self, request):
+        # ssl.SSLSocket.close() не шлёт TLS close_notify - строгие клиенты
+        # (OkHttp/URLSession) читают это как оборванное соединение. unwrap()
+        # делает штатное TLS-прощание перед закрытием сокета.
+        try:
+            request.unwrap()
+        except Exception:
+            pass
+        super().shutdown_request(request)
+
+
 def start_subscription_server():
     ensure_self_signed_cert()
-    server = ThreadingHTTPServer(("0.0.0.0", SUB_HTTPS_PORT), SubscriptionRequestHandler)
+    server = SubscriptionHTTPSServer(("0.0.0.0", SUB_HTTPS_PORT), SubscriptionRequestHandler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=SUB_CERT_FILE, keyfile=SUB_KEY_FILE)
     server.socket = context.wrap_socket(server.socket, server_side=True)
