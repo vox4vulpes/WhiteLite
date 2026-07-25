@@ -16,6 +16,8 @@ services:
     container_name: vpn-bot
     env_file:
       - .env
+    ports:
+      - "${SUB_HTTPS_PORT:-8443}:8443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./bot-data:/data

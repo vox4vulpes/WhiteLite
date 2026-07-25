@@ -5,9 +5,12 @@ import os
 import json
 import time
 import re
+import secrets
+import ssl
 import threading
 import concurrent.futures
 import ipaddress
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from io import BytesIO
 
@@ -51,6 +54,14 @@ WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_
 DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
 WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [...], "updated_at": ts}
 JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
+WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # {"token": "..."}
+WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # последняя выгруженная подписка
+
+SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
+SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
+SUB_CERT_FILE = os.path.join(SUB_CERT_DIR, "cert.pem")
+SUB_KEY_FILE = os.path.join(SUB_CERT_DIR, "key.pem")
+PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")  # IP/домен, по которому клиент достучится до /sub/<token>
 
 # Заведённые вручную по факту обнаруженной поломки: проходят HTTP-пробу (латенси/скорость),
 # но реально не работают как jitsi-провайдер для olcrtc. Дозаполняется по мере находок.
@@ -117,6 +128,90 @@ def get_whitesub_pool():
 
 def save_whitesub_pool(hosts):
     save_json_file(WHITESUB_POOL_FILE, {"hosts": hosts, "updated_at": time.time()})
+
+
+def get_whitesub_token():
+    """Стабильный секретный токен для ссылки-подписки /sub/<token>.
+    Генерируется один раз и переживает рестарты бота (лежит в /data)."""
+    data = load_json_file(WHITESUB_TOKEN_FILE, None)
+    if data and data.get("token"):
+        return data["token"]
+    token = secrets.token_urlsafe(24)
+    save_json_file(WHITESUB_TOKEN_FILE, {"token": token})
+    return token
+
+
+def save_whitesub_last_text(text):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(WHITESUB_LAST_TEXT_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def load_whitesub_last_text():
+    if not os.path.exists(WHITESUB_LAST_TEXT_FILE):
+        return None
+    with open(WHITESUB_LAST_TEXT_FILE, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def ensure_self_signed_cert():
+    """Самоподписанный сертификат для /sub - клиент (olcbox) подключается с
+    allowInsecureRequests=true и не проверяет hostname/issuer, так что тут
+    важен только сам факт TLS (шифрование канала), а не доверенный CA."""
+    if os.path.exists(SUB_CERT_FILE) and os.path.exists(SUB_KEY_FILE):
+        return
+    os.makedirs(SUB_CERT_DIR, exist_ok=True)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-nodes", "-days", "3650",
+        "-keyout", SUB_KEY_FILE, "-out", SUB_CERT_FILE,
+        "-subj", "/CN=whitelite-sub",
+    ], check=True, capture_output=True, text=True)
+
+
+class SubscriptionRequestHandler(BaseHTTPRequestHandler):
+    """Отдаёт последнюю сформированную /whitesub-подписку по адресу /sub/<token>.
+    Любой другой путь или неверный токен - 404, чтобы не подсказывать сканерам,
+    что путь вообще существует."""
+
+    def do_GET(self):
+        token = get_whitesub_token()
+        if self.path != f"/sub/{token}":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        text = load_whitesub_last_text()
+        if text is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # не шумим в логи бота на случайные сканы порта
+
+
+def start_subscription_server():
+    ensure_self_signed_cert()
+    server = ThreadingHTTPServer(("0.0.0.0", SUB_HTTPS_PORT), SubscriptionRequestHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=SUB_CERT_FILE, keyfile=SUB_KEY_FILE)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
+
+
+def get_whitesub_link():
+    host = PUBLIC_HOST.strip()
+    if not host:
+        return None
+    return f"https://{host}:{SUB_HTTPS_PORT}/sub/{get_whitesub_token()}"
 
 
 def get_jitsi_denylist():
@@ -389,7 +484,7 @@ def handle_start(message):
         "*/list* — список всех клиентов: OpenVPN и White отдельно, внутри групп по убыванию трафика/активности\n"
         "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
         "*/whitesub* `-setup [N]` — прогоняет оба скана (как `-best_all -test`), присылает полный список и ждёт от тебя номера позиций, которые реально работают в твоей сети — ответь на сообщение-приглашение номерами через запятую/пробел, сохранит лучшие N из подтверждённых как пул (по умолчанию N=5), туннели пока не поднимает; добавь `-checkoff`, чтобы пропустить проверку анонимного XMPP-логина\n"
-        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5) и сразу присылает файл подписки (для импорта в olcbox: добавление конфигурации → импорт из файла)\n"
+        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5) и сразу присылает файл подписки и `https` ссылку на неё (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный)\n"
         "*/start* — показать это сообщение",
         parse_mode="Markdown"
     )
@@ -875,6 +970,8 @@ def handle_whitesub_deploy(message, count):
 
     if entries:
         text = build_whitesub_text(entries)
+        save_whitesub_last_text(text)
+
         file_buf = BytesIO(text.encode("utf-8"))
         file_buf.name = "whitesub.txt"
         bot.send_document(
@@ -885,6 +982,17 @@ def handle_whitesub_deploy(message, count):
                 "Импортируй файл в olcbox: добавление конфигурации → импорт из файла."
             )
         )
+
+        link = get_whitesub_link()
+        if link:
+            bot.send_message(
+                message.chat.id,
+                "🔗 Или ссылкой (обновляется этим же адресом при каждом `/whitesub`):\n"
+                f"`{link}`\n"
+                "В olcbox: добавление конфигурации → ввести ссылку → включи "
+                "`Allow insecure requests` (сертификат самоподписанный, это ожидаемо).",
+                parse_mode="Markdown"
+            )
 
 
 def handle_whitesub_setup(message, count, check_anonymous_login=True):
@@ -1414,5 +1522,9 @@ if __name__ == "__main__":
     take_snapshot()
     t = threading.Thread(target=snapshot_loop, daemon=True)
     t.start()
+
+    sub_server_thread = threading.Thread(target=start_subscription_server, daemon=True)
+    sub_server_thread.start()
+
     print("Бот запущен...")
     bot.infinity_polling()

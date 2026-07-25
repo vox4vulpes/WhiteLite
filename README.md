@@ -42,8 +42,12 @@ Inspired by the write-up at https://www.pvsm.ru/vpn/449328.
   on your network; saves the best N of those as a pool (default N=5), without
   deploying anything yet.
 - `/whitesub [N]` — deploys N tunnels from that saved pool and immediately
-  sends a `sub.md`-format subscription file (importable in olcbox: add
-  configuration → import from file).
+  sends a `sub.md`-format subscription file, plus an `https` link serving the
+  same content (importable in olcbox: add configuration → import from file,
+  or enter link/URI). The link uses a self-signed cert — enable
+  `Allow insecure requests` in olcbox when adding it by link. The link is
+  stable across `/whitesub` calls (same token), so olcbox's subscription
+  auto-refresh will pick up the latest deploy without re-pasting anything.
 - `/list` — every client ever issued (OpenVPN certs + live White/Jitsi
   containers), sorted by traffic/activity within each group.
 - `/monitor` — OpenVPN bandwidth and connected-client stats.
@@ -82,6 +86,8 @@ Step 3 is what `-checkoff` disables.
    # BOT_TOKEN=<from @BotFather>
    # ADMIN_TELEGRAM_ID=<your Telegram numeric user ID>
    # OVPN_PORT=1194
+   # PUBLIC_HOST=<your server's public IP or domain, for the /whitesub link>
+   # SUB_HTTPS_PORT=8443
    ```
 3. Initialize the OpenVPN PKI (first run only) — see the
    [kylemanna/openvpn](https://github.com/kylemanna/openvpn) docs, or restore
@@ -106,9 +112,10 @@ Step 3 is what `-checkoff` disables.
 ## Data persistence
 
 The bot stores its own state (client name aliases, White-tunnel metadata,
-default Jitsi server, the Jitsi denylist, the `/whitesub -setup` pool) under
-`/data` inside the container, backed by the `./bot-data` volume — keep it
-around across rebuilds/restarts.
+default Jitsi server, the Jitsi denylist, the `/whitesub -setup` pool, the
+`/whitesub` link token and last-generated subscription text, the self-signed
+TLS cert for that link) under `/data` inside the container, backed by the
+`./bot-data` volume — keep it around across rebuilds/restarts.
 
 ## Security notes
 
@@ -117,3 +124,13 @@ around across rebuilds/restarts.
 - `bot-data/white_configs.json` contains the encryption keys of active White
   tunnels. Never commit or share it.
 - `.env` contains a live Telegram bot token. Never commit or share it.
+- `bot-data/whitesub_token.json` and `bot-data/whitesub_last.txt` are the
+  subscription link's secret token and its current content (tunnel keys
+  included) — treat like any other secret in `bot-data/`.
+- The `/whitesub` link is served over HTTPS on `SUB_HTTPS_PORT` (default
+  `8443`) using a self-signed cert generated on first run — this only
+  protects the channel in transit, not the identity of the server (olcbox
+  connects with certificate validation disabled for this specific link, by
+  design). Anyone who obtains the link/token can fetch the current pool of
+  tunnel configs; there's no built-in rotation, so treat leaking it like
+  leaking the `.txt` file itself.
