@@ -605,16 +605,27 @@ def main_menu_keyboard():
         telebot.types.InlineKeyboardButton("🚀 White: авто-подбор", callback_data="cmd:white_best_all"),
     )
     kb.add(
-        telebot.types.InlineKeyboardButton("📦 Whitesub: настроить пул", callback_data="cmd:whitesub_setup"),
-        telebot.types.InlineKeyboardButton("📬 Whitesub: получить конфиги", callback_data="cmd:whitesub_deploy"),
-    )
-    kb.add(
-        telebot.types.InlineKeyboardButton("🆕 Whitesub: новая подписка", callback_data="cmd:whitesub_new"),
-        telebot.types.InlineKeyboardButton("📚 Whitesub: список подписок", callback_data="cmd:whitesub_list"),
+        telebot.types.InlineKeyboardButton("📦 Whitesub", callback_data="cmd:whitesub_menu"),
     )
     kb.add(
         telebot.types.InlineKeyboardButton("📋 Список", callback_data="cmd:list"),
         telebot.types.InlineKeyboardButton("📊 Мониторинг", callback_data="cmd:monitor"),
+    )
+    return kb
+
+
+def whitesub_submenu_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        telebot.types.InlineKeyboardButton("🧮 Настроить пул", callback_data="cmd:whitesub_setup"),
+        telebot.types.InlineKeyboardButton("📬 Получить конфиги", callback_data="cmd:whitesub_deploy"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("🆕 Новая подписка", callback_data="cmd:whitesub_new"),
+        telebot.types.InlineKeyboardButton("📚 Список подписок", callback_data="cmd:whitesub_list"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:menu_main"),
     )
     return kb
 
@@ -667,7 +678,19 @@ def handle_menu_callback(call):
     fake = FakeMessage(call.message.chat.id, call.from_user.id, "", call.message.message_id)
 
     try:
-        if action == "new":
+        if action == "whitesub_menu":
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=whitesub_submenu_keyboard()
+            )
+            return
+        elif action == "menu_main":
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        elif action == "new":
             handle_new_vpn(fake)
         elif action == "white":
             fake.text = "/white"
@@ -696,6 +719,18 @@ def handle_menu_callback(call):
             bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
         except Exception:
             pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wsub_use:"))
+def handle_wsub_use_callback(call):
+    bot.answer_callback_query(call.id)
+    if call.from_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    sub_id = call.data[len("wsub_use:"):]
+    fake = FakeMessage(call.message.chat.id, call.from_user.id, "", call.message.message_id)
+    handle_whitesub_use(fake, sub_id)
+
 
 @bot.message_handler(commands=['new'])
 def handle_new_vpn(message):
@@ -1176,6 +1211,7 @@ def handle_whitesub_list(message):
 
     active_id = store.get("active_id")
     lines = ["📚 Подписки:"]
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
     for sub_id, sub in store["subscriptions"].items():
         mark = "★" if sub_id == active_id else "·"
         empty = " (пусто)" if not sub.get("last_text") else ""
@@ -1183,7 +1219,13 @@ def handle_whitesub_list(message):
         link = whitesub_link_for(sub_id, sub)
         if link:
             lines.append(f"    `{link}`")
+        if sub_id != active_id:
+            kb.add(telebot.types.InlineKeyboardButton(
+                f"➡️ Сделать активной: {sub['name']}", callback_data=f"wsub_use:{sub_id}"
+            ))
     send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+    if kb.keyboard:
+        bot.send_message(message.chat.id, "Переключить активную:", reply_markup=kb)
 
 
 def handle_whitesub_use(message, sub_id):
