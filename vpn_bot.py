@@ -56,6 +56,7 @@ WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [
 JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
 WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # {"token": "..."}
 WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # последняя выгруженная подписка
+WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # {"id": "...", "name": "..."}
 
 SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
 SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
@@ -80,6 +81,9 @@ pending_rename = {}
 # message_id сообщения-запроса /whitesub -setup -> {"combined": [...], "count": N}.
 # Тоже только в памяти - если бот перезапустится до ответа, придётся запускать -setup заново.
 pending_whitesub_setup = {}
+
+# message_id сводного сообщения /whitesub -> True, для переименования подписки по reply.
+pending_whitesub_rename = {}
 
 
 def is_admin(message):
@@ -139,6 +143,25 @@ def get_whitesub_token():
     token = secrets.token_urlsafe(24)
     save_json_file(WHITESUB_TOKEN_FILE, {"token": token})
     return token
+
+
+def get_whitesub_meta():
+    """Публичный (не секретный) id подписки + её отображаемое имя.
+    id отдельный от токена ссылки специально - его можно спокойно показывать
+    в чате/логах, не раскрывая сам секрет доступа к /sub/<token>."""
+    data = load_json_file(WHITESUB_META_FILE, None)
+    if data and data.get("id"):
+        return data
+    meta = {"id": f"wsub-{secrets.token_hex(4)}", "name": "WhiteLite"}
+    save_json_file(WHITESUB_META_FILE, meta)
+    return meta
+
+
+def set_whitesub_name(name):
+    meta = get_whitesub_meta()
+    meta["name"] = name
+    save_json_file(WHITESUB_META_FILE, meta)
+    return meta
 
 
 def save_whitesub_last_text(text):
@@ -499,7 +522,7 @@ def handle_start(message):
         "*/list* — список всех клиентов: OpenVPN и White отдельно, внутри групп по убыванию трафика/активности\n"
         "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
         "*/whitesub* `-setup [N]` — прогоняет оба скана (как `-best_all -test`), присылает полный список и ждёт от тебя номера позиций, которые реально работают в твоей сети — ответь на сообщение-приглашение номерами через запятую/пробел, сохранит лучшие N из подтверждённых как пул (по умолчанию N=5), туннели пока не поднимает; добавь `-checkoff`, чтобы пропустить проверку анонимного XMPP-логина\n"
-        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5) и сразу присылает файл подписки и `https` ссылку на неё (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный)\n"
+        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5), одним сообщением присылает все конфиги подписки, затем файл подписки и `https` ссылку на неё (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный). У подписки есть свой id и имя (по умолчанию `WhiteLite`) - ответь на сводное сообщение текстом, чтобы переименовать\n"
         "*/start* — показать это сообщение",
         parse_mode="Markdown"
     )
@@ -937,11 +960,11 @@ def handle_whitesub(message):
     handle_whitesub_deploy(message, count)
 
 
-def build_whitesub_text(entries, subscription_name="WhiteLite"):
+def build_whitesub_text(entries, meta):
     """entries: список (container_name, cfg). Формат совпадает с sub.md из olcRTC -
     plain text с #-глобальными полями и ##-локальными полями под каждым olcrtc://."""
     names_map = get_client_names()
-    lines = [f"#name: {subscription_name}", f"#update: {int(time.time())}"]
+    lines = [f"#name: {meta['name']}", f"#id: {meta['id']}", f"#update: {int(time.time())}"]
     for container_name, cfg in entries:
         alias = names_map.get(container_name)
         label = alias if alias else container_name
@@ -971,20 +994,44 @@ def handle_whitesub_deploy(message, count):
     for host in hosts:
         try:
             container_name, room_id, uri = create_white_tunnel(host, source="whitesub")
-            announce_white_tunnel(message.chat.id, host, container_name, room_id, uri)
             entries.append((container_name, {"uri": uri}))
         except Exception as e:
             failed.append((host, str(e)))
 
-    summary = [f"✅ Поднято: {len(entries)}/{len(hosts)}"]
+    meta = get_whitesub_meta()
+    names_map = get_client_names()
+
+    summary = [f"✅ *{meta['name']}* (`{meta['id']}`) — поднято {len(entries)}/{len(hosts)}"]
+    for container_name, cfg in entries:
+        alias = names_map.get(container_name)
+        label = alias if alias else container_name
+        summary.append(f"`{label}`\n`{cfg['uri']}`")
     if failed:
         summary.append("❌ Ошибки:")
         for host, err in failed:
             summary.append(f"  `{host}`: {err}")
-    bot.edit_message_text("\n".join(summary), message.chat.id, status.message_id, parse_mode="Markdown")
+    summary.append(
+        "\nОтветь на это сообщение текстом, чтобы задать имя подписки "
+        "(сейчас видно в файле/ссылке как `#name:`)."
+    )
+    bot.delete_message(message.chat.id, status.message_id)
+    sent = None
+    chunk = ""
+    for block in summary:
+        candidate = f"{chunk}\n\n{block}" if chunk else block
+        if len(candidate) > TELEGRAM_MSG_LIMIT:
+            if chunk:
+                sent = bot.send_message(message.chat.id, chunk, parse_mode="Markdown")
+            chunk = block
+        else:
+            chunk = candidate
+    if chunk:
+        sent = bot.send_message(message.chat.id, chunk, parse_mode="Markdown")
+    if sent:
+        pending_whitesub_rename[sent.message_id] = True
 
     if entries:
-        text = build_whitesub_text(entries)
+        text = build_whitesub_text(entries, meta)
         save_whitesub_last_text(text)
 
         file_buf = BytesIO(text.encode("utf-8"))
@@ -993,7 +1040,7 @@ def handle_whitesub_deploy(message, count):
             message.chat.id,
             file_buf,
             caption=(
-                f"📦 Подписка из {len(entries)} профилей\n"
+                f"📦 Подписка «{meta['name']}» (`{meta['id']}`), {len(entries)} профилей\n"
                 "Импортируй файл в olcbox: добавление конфигурации → импорт из файла."
             )
         )
@@ -1511,6 +1558,13 @@ def handle_text(message):
 
             if reply_id in pending_whitesub_setup:
                 process_whitesub_setup_reply(message, reply_id)
+                return
+
+            if reply_id in pending_whitesub_rename:
+                pending_whitesub_rename.pop(reply_id)
+                name = sanitize_alias(text)
+                set_whitesub_name(name)
+                bot.reply_to(message, f"✅ Имя подписки обновлено: {name}", parse_mode="Markdown")
                 return
 
             if reply_id in pending_rename:
