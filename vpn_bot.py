@@ -617,12 +617,8 @@ def main_menu_keyboard():
 def whitesub_submenu_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        telebot.types.InlineKeyboardButton("🧮 Настроить пул", callback_data="cmd:whitesub_setup"),
-        telebot.types.InlineKeyboardButton("📬 Получить конфиги", callback_data="cmd:whitesub_deploy"),
-    )
-    kb.add(
         telebot.types.InlineKeyboardButton("🆕 Новая подписка", callback_data="cmd:whitesub_new"),
-        telebot.types.InlineKeyboardButton("📚 Список подписок", callback_data="cmd:whitesub_list"),
+        telebot.types.InlineKeyboardButton("📚 Список", callback_data="cmd:whitesub_list"),
     )
     kb.add(
         telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:menu_main"),
@@ -698,12 +694,6 @@ def handle_menu_callback(call):
         elif action == "white_best_all":
             fake.text = "/white -best_all"
             handle_white(fake)
-        elif action == "whitesub_setup":
-            fake.text = "/whitesub -setup"
-            handle_whitesub(fake)
-        elif action == "whitesub_deploy":
-            fake.text = "/whitesub"
-            handle_whitesub(fake)
         elif action == "whitesub_new":
             fake.text = "/whitesub -new"
             handle_whitesub(fake)
