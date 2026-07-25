@@ -54,9 +54,11 @@ WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_
 DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
 WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [...], "updated_at": ts}
 JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
-WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # {"token": "..."}
-WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # последняя выгруженная подписка
-WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # {"id": "...", "name": "..."}
+WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # legacy, только для миграции
+WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # legacy, только для миграции
+WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, только для миграции
+WHITESUB_SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "whitesub_subscriptions.json")
+# {"active_id": "wsub-xxxx", "subscriptions": {"wsub-xxxx": {"name","token","last_text","created_at"}}}
 
 SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
 SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
@@ -134,47 +136,110 @@ def save_whitesub_pool(hosts):
     save_json_file(WHITESUB_POOL_FILE, {"hosts": hosts, "updated_at": time.time()})
 
 
-def get_whitesub_token():
-    """Стабильный секретный токен для ссылки-подписки /sub/<token>.
-    Генерируется один раз и переживает рестарты бота (лежит в /data)."""
-    data = load_json_file(WHITESUB_TOKEN_FILE, None)
-    if data and data.get("token"):
-        return data["token"]
-    token = secrets.token_urlsafe(24)
-    save_json_file(WHITESUB_TOKEN_FILE, {"token": token})
-    return token
-
-
-def get_whitesub_meta():
-    """Публичный (не секретный) id подписки + её отображаемое имя.
-    id отдельный от токена ссылки специально - его можно спокойно показывать
-    в чате/логах, не раскрывая сам секрет доступа к /sub/<token>."""
-    data = load_json_file(WHITESUB_META_FILE, None)
-    if data and data.get("id"):
-        return data
-    meta = {"id": f"wsub-{secrets.token_hex(4)}", "name": "WhiteLite"}
-    save_json_file(WHITESUB_META_FILE, meta)
-    return meta
-
-
-def set_whitesub_name(name):
-    meta = get_whitesub_meta()
-    meta["name"] = name
-    save_json_file(WHITESUB_META_FILE, meta)
-    return meta
-
-
-def save_whitesub_last_text(text):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(WHITESUB_LAST_TEXT_FILE, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def load_whitesub_last_text():
-    if not os.path.exists(WHITESUB_LAST_TEXT_FILE):
+def _migrate_legacy_whitesub_subscription():
+    """Одноразовая миграция единственной старой подписки (meta+token+last_text
+    из версии до мульти-подписок) в новое хранилище - чтобы уже выданная
+    ссылка не сломалась при обновлении бота."""
+    meta = load_json_file(WHITESUB_META_FILE, None)
+    token_data = load_json_file(WHITESUB_TOKEN_FILE, None)
+    if not meta or not token_data:
         return None
-    with open(WHITESUB_LAST_TEXT_FILE, "r", encoding="utf-8") as f:
-        return f.read()
+
+    last_text = None
+    if os.path.exists(WHITESUB_LAST_TEXT_FILE):
+        with open(WHITESUB_LAST_TEXT_FILE, "r", encoding="utf-8") as f:
+            last_text = f.read()
+
+    sub_id = meta["id"]
+    return {
+        "active_id": sub_id,
+        "subscriptions": {
+            sub_id: {
+                "name": meta.get("name", "WhiteLite"),
+                "token": token_data["token"],
+                "last_text": last_text,
+                "created_at": time.time(),
+            }
+        }
+    }
+
+
+def get_whitesub_store():
+    data = load_json_file(WHITESUB_SUBSCRIPTIONS_FILE, None)
+    if data:
+        return data
+    migrated = _migrate_legacy_whitesub_subscription()
+    store = migrated or {"active_id": None, "subscriptions": {}}
+    save_json_file(WHITESUB_SUBSCRIPTIONS_FILE, store)
+    return store
+
+
+def save_whitesub_store(store):
+    save_json_file(WHITESUB_SUBSCRIPTIONS_FILE, store)
+
+
+def create_whitesub_subscription(name=None):
+    store = get_whitesub_store()
+    sub_id = f"wsub-{secrets.token_hex(4)}"
+    sub = {
+        "name": name or "WhiteLite",
+        "token": secrets.token_urlsafe(24),
+        "last_text": None,
+        "created_at": time.time(),
+    }
+    store["subscriptions"][sub_id] = sub
+    store["active_id"] = sub_id
+    save_whitesub_store(store)
+    return sub_id, sub
+
+
+def get_active_whitesub_subscription():
+    """Возвращает (id, sub) активной подписки, создавая первую подписку
+    по умолчанию, если их вообще ещё нет."""
+    store = get_whitesub_store()
+    active_id = store.get("active_id")
+    if active_id and active_id in store["subscriptions"]:
+        return active_id, store["subscriptions"][active_id]
+    if store["subscriptions"]:
+        sub_id = next(iter(store["subscriptions"]))
+        store["active_id"] = sub_id
+        save_whitesub_store(store)
+        return sub_id, store["subscriptions"][sub_id]
+    return create_whitesub_subscription()
+
+
+def set_active_whitesub_subscription(sub_id):
+    store = get_whitesub_store()
+    if sub_id not in store["subscriptions"]:
+        return False
+    store["active_id"] = sub_id
+    save_whitesub_store(store)
+    return True
+
+
+def rename_whitesub_subscription(sub_id, name):
+    store = get_whitesub_store()
+    if sub_id not in store["subscriptions"]:
+        return False
+    store["subscriptions"][sub_id]["name"] = name
+    save_whitesub_store(store)
+    return True
+
+
+def save_whitesub_subscription_text(sub_id, text):
+    store = get_whitesub_store()
+    if sub_id not in store["subscriptions"]:
+        return
+    store["subscriptions"][sub_id]["last_text"] = text
+    save_whitesub_store(store)
+
+
+def find_whitesub_subscription_by_token(token):
+    store = get_whitesub_store()
+    for sub_id, sub in store["subscriptions"].items():
+        if sub["token"] == token:
+            return sub_id, sub
+    return None, None
 
 
 def ensure_self_signed_cert():
@@ -193,27 +258,35 @@ def ensure_self_signed_cert():
 
 
 class SubscriptionRequestHandler(BaseHTTPRequestHandler):
-    """Отдаёт последнюю сформированную /whitesub-подписку по адресу /sub/<token>.
-    Любой другой путь или неверный токен - 404, чтобы не подсказывать сканерам,
-    что путь вообще существует."""
+    """Отдаёт последнюю сформированную подписку по адресу /sub/<token>, где
+    token однозначно определяет одну из (возможно нескольких) подписок.
+    Любой другой путь или неизвестный токен - 404, чтобы не подсказывать
+    сканерам, что путь вообще существует."""
 
     protocol_version = "HTTP/1.1"  # длина тела всегда явная (Content-Length),
     # а не полагается на "конец = закрытие соединения" как в HTTP/1.0
 
+    def send_empty(self, code):
+        # под HTTP/1.1 без Content-Length клиент не понимает, где кончается
+        # ответ, и виснет в ожидании (сервер держит keep-alive) - явный 0
+        # обязателен даже для пустого тела.
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
-        token = get_whitesub_token()
-        if self.path != f"/sub/{token}":
-            self.send_response(404)
-            self.end_headers()
+        prefix = "/sub/"
+        if not self.path.startswith(prefix):
+            self.send_empty(404)
             return
 
-        text = load_whitesub_last_text()
-        if text is None:
-            self.send_response(404)
-            self.end_headers()
+        token = self.path[len(prefix):]
+        _, sub = find_whitesub_subscription_by_token(token)
+        if sub is None or not sub.get("last_text"):
+            self.send_empty(404)
             return
 
-        body = text.encode("utf-8")
+        body = sub["last_text"].encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -245,11 +318,11 @@ def start_subscription_server():
     server.serve_forever()
 
 
-def get_whitesub_link():
+def whitesub_link_for(sub_id, sub):
     host = PUBLIC_HOST.strip()
     if not host:
         return None
-    return f"https://{host}:{SUB_HTTPS_PORT}/sub/{get_whitesub_token()}"
+    return f"https://{host}:{SUB_HTTPS_PORT}/sub/{sub['token']}"
 
 
 def get_jitsi_denylist():
@@ -536,6 +609,10 @@ def main_menu_keyboard():
         telebot.types.InlineKeyboardButton("📬 Whitesub: получить конфиги", callback_data="cmd:whitesub_deploy"),
     )
     kb.add(
+        telebot.types.InlineKeyboardButton("🆕 Whitesub: новая подписка", callback_data="cmd:whitesub_new"),
+        telebot.types.InlineKeyboardButton("📚 Whitesub: список подписок", callback_data="cmd:whitesub_list"),
+    )
+    kb.add(
         telebot.types.InlineKeyboardButton("📋 Список", callback_data="cmd:list"),
         telebot.types.InlineKeyboardButton("📊 Мониторинг", callback_data="cmd:monitor"),
     )
@@ -562,7 +639,10 @@ def handle_start(message):
         "*/list* — список всех клиентов: OpenVPN и White отдельно, внутри групп по убыванию трафика/активности\n"
         "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
         "*/whitesub* `-setup [N]` — прогоняет оба скана (как `-best_all -test`), присылает полный список и ждёт от тебя номера позиций, которые реально работают в твоей сети — ответь на сообщение-приглашение номерами через запятую/пробел, сохранит лучшие N из подтверждённых как пул (по умолчанию N=5), туннели пока не поднимает; добавь `-checkoff`, чтобы пропустить проверку анонимного XMPP-логина\n"
-        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5), одним сообщением присылает все конфиги подписки, затем файл подписки и `https` ссылку на неё (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный). У подписки есть свой id и имя (по умолчанию `WhiteLite`) - ответь на сводное сообщение текстом, чтобы переименовать\n"
+        "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5) в *активную* подписку, одним сообщением присылает все её конфиги, затем файл и `https` ссылку (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный). Ответь на сводное сообщение текстом, чтобы переименовать подписку\n"
+        "*/whitesub* `-new [имя]` — создаёт новую подписку со своим id и уникальной ссылкой, делает её активной\n"
+        "*/whitesub* `-list` — список всех подписок с их id/именем/ссылкой (★ - активная)\n"
+        "*/whitesub* `-use <id>` — переключить активную подписку\n"
         "*/start* — показать это сообщение\n"
         "*/menu* — показать кнопки меню",
         parse_mode="Markdown",
@@ -600,6 +680,12 @@ def handle_menu_callback(call):
             handle_whitesub(fake)
         elif action == "whitesub_deploy":
             fake.text = "/whitesub"
+            handle_whitesub(fake)
+        elif action == "whitesub_new":
+            fake.text = "/whitesub -new"
+            handle_whitesub(fake)
+        elif action == "whitesub_list":
+            fake.text = "/whitesub -list"
             handle_whitesub(fake)
         elif action == "list":
             handle_list(fake)
@@ -1013,21 +1099,42 @@ def handle_whitesub(message):
 
     tokens = message.text.split()[1:]
     flags = {t for t in tokens if t.startswith('-')}
-    numbers = [t for t in tokens if not t.startswith('-')]
+    words = [t for t in tokens if not t.startswith('-')]
 
-    unknown = flags - {"-setup", "-checkoff"}
+    unknown = flags - {"-setup", "-checkoff", "-new", "-list", "-use"}
     if unknown:
         bot.reply_to(message, f"⛔ Неизвестный аргумент: {', '.join(sorted(unknown))}")
+        return
+
+    exclusive = flags & {"-setup", "-new", "-list", "-use"}
+    if len(exclusive) > 1:
+        bot.reply_to(message, f"⛔ Нельзя указать одновременно {', '.join(sorted(exclusive))}.")
         return
 
     if "-checkoff" in flags and "-setup" not in flags:
         bot.reply_to(message, "⛔ -checkoff работает только вместе с -setup.")
         return
 
+    if "-new" in flags:
+        name = sanitize_alias(" ".join(words)) if words else "WhiteLite"
+        handle_whitesub_new(message, name)
+        return
+
+    if "-list" in flags:
+        handle_whitesub_list(message)
+        return
+
+    if "-use" in flags:
+        if not words:
+            bot.reply_to(message, "⛔ Укажи id подписки: `/whitesub -use wsub-xxxxxxxx`", parse_mode="Markdown")
+            return
+        handle_whitesub_use(message, words[0])
+        return
+
     count = WHITESUB_DEFAULT_COUNT
-    if numbers:
+    if words:
         try:
-            count = int(numbers[0])
+            count = int(words[0])
         except ValueError:
             bot.reply_to(message, "⛔ N должно быть числом, например `/whitesub 10`.", parse_mode="Markdown")
             return
@@ -1044,11 +1151,54 @@ def handle_whitesub(message):
     handle_whitesub_deploy(message, count)
 
 
-def build_whitesub_text(entries, meta):
+def handle_whitesub_new(message, name):
+    sub_id, sub = create_whitesub_subscription(name)
+    link = whitesub_link_for(sub_id, sub)
+    text = (
+        "✅ Новая подписка создана и сделана активной\n"
+        f"🏷 Имя: {sub['name']}\n"
+        f"🆔 id: `{sub_id}`\n"
+    )
+    if link:
+        text += f"🔗 Ссылка: `{link}`\n"
+    text += (
+        "\nДальнейшие `/whitesub [N]` наполняют именно её. "
+        "Переключиться на другую: `/whitesub -use <id>`, список всех: `/whitesub -list`."
+    )
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+
+def handle_whitesub_list(message):
+    store = get_whitesub_store()
+    if not store["subscriptions"]:
+        bot.reply_to(message, "Подписок пока нет. Создай через `/whitesub -new [имя]`.", parse_mode="Markdown")
+        return
+
+    active_id = store.get("active_id")
+    lines = ["📚 Подписки:"]
+    for sub_id, sub in store["subscriptions"].items():
+        mark = "★" if sub_id == active_id else "·"
+        empty = " (пусто)" if not sub.get("last_text") else ""
+        lines.append(f"{mark} `{sub_id}` — {sub['name']}{empty}")
+        link = whitesub_link_for(sub_id, sub)
+        if link:
+            lines.append(f"    `{link}`")
+    send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
+
+def handle_whitesub_use(message, sub_id):
+    if not set_active_whitesub_subscription(sub_id):
+        bot.reply_to(message, f"⛔ Подписка `{sub_id}` не найдена. Смотри `/whitesub -list`.", parse_mode="Markdown")
+        return
+    _, sub = get_active_whitesub_subscription()
+    bot.reply_to(message, f"✅ Активная подписка теперь: {sub['name']} (`{sub_id}`)", parse_mode="Markdown")
+
+
+def build_whitesub_text(entries, sub_id, sub):
     """entries: список (container_name, cfg). Формат совпадает с sub.md из olcRTC -
     plain text с #-глобальными полями и ##-локальными полями под каждым olcrtc://."""
     names_map = get_client_names()
-    lines = [f"#name: {meta['name']}", f"#id: {meta['id']}", f"#update: {int(time.time())}"]
+    lines = [f"#name: {sub['name']}", f"#id: {sub_id}", f"#update: {int(time.time())}"]
     for container_name, cfg in entries:
         alias = names_map.get(container_name)
         label = alias if alias else container_name
@@ -1082,10 +1232,10 @@ def handle_whitesub_deploy(message, count):
         except Exception as e:
             failed.append((host, str(e)))
 
-    meta = get_whitesub_meta()
+    sub_id, sub = get_active_whitesub_subscription()
     names_map = get_client_names()
 
-    summary = [f"✅ *{meta['name']}* (`{meta['id']}`) — поднято {len(entries)}/{len(hosts)}"]
+    summary = [f"✅ *{sub['name']}* (`{sub_id}`) — поднято {len(entries)}/{len(hosts)}"]
     for container_name, cfg in entries:
         alias = names_map.get(container_name)
         label = alias if alias else container_name
@@ -1112,11 +1262,11 @@ def handle_whitesub_deploy(message, count):
     if chunk:
         sent = bot.send_message(message.chat.id, chunk, parse_mode="Markdown")
     if sent:
-        pending_whitesub_rename[sent.message_id] = True
+        pending_whitesub_rename[sent.message_id] = sub_id
 
     if entries:
-        text = build_whitesub_text(entries, meta)
-        save_whitesub_last_text(text)
+        text = build_whitesub_text(entries, sub_id, sub)
+        save_whitesub_subscription_text(sub_id, text)
 
         file_buf = BytesIO(text.encode("utf-8"))
         file_buf.name = "whitesub.txt"
@@ -1124,12 +1274,12 @@ def handle_whitesub_deploy(message, count):
             message.chat.id,
             file_buf,
             caption=(
-                f"📦 Подписка «{meta['name']}» (`{meta['id']}`), {len(entries)} профилей\n"
+                f"📦 Подписка «{sub['name']}» (`{sub_id}`), {len(entries)} профилей\n"
                 "Импортируй файл в olcbox: добавление конфигурации → импорт из файла."
             )
         )
 
-        link = get_whitesub_link()
+        link = whitesub_link_for(sub_id, sub)
         if link:
             bot.send_message(
                 message.chat.id,
@@ -1645,10 +1795,12 @@ def handle_text(message):
                 return
 
             if reply_id in pending_whitesub_rename:
-                pending_whitesub_rename.pop(reply_id)
+                sub_id = pending_whitesub_rename.pop(reply_id)
                 name = sanitize_alias(text)
-                set_whitesub_name(name)
-                bot.reply_to(message, f"✅ Имя подписки обновлено: {name}", parse_mode="Markdown")
+                if rename_whitesub_subscription(sub_id, name):
+                    bot.reply_to(message, f"✅ Имя подписки `{sub_id}` обновлено: {name}", parse_mode="Markdown")
+                else:
+                    bot.reply_to(message, f"⛔ Подписка `{sub_id}` больше не существует.", parse_mode="Markdown")
                 return
 
             if reply_id in pending_rename:
