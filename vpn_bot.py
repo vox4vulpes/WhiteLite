@@ -503,12 +503,52 @@ def scan_best_long_jitsi(progress_cb, hosts=None, check_anonymous_login=True):
     return results, total
 
 
+class _Ns:
+    """Заглушка объекта-контейнера атрибутов - чтобы не тащить лишний импорт
+    types/SimpleNamespace ради пары полей."""
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class FakeMessage:
+    """Подделка telebot.types.Message для переиспользования уже существующих
+    обработчиков команд из callback-кнопок меню - один код путь что для
+    текстовой команды, что для кнопки, без дублирования логики."""
+    def __init__(self, chat_id, user_id, text, message_id):
+        self.chat = _Ns(id=chat_id)
+        self.from_user = _Ns(id=user_id)
+        self.text = text
+        self.message_id = message_id
+        self.reply_to_message = None
+
+
+def main_menu_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        telebot.types.InlineKeyboardButton("🆕 Новый OpenVPN", callback_data="cmd:new"),
+        telebot.types.InlineKeyboardButton("🌐 White (по умолчанию)", callback_data="cmd:white"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("🚀 White: авто-подбор", callback_data="cmd:white_best_all"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("📦 Whitesub: настроить пул", callback_data="cmd:whitesub_setup"),
+        telebot.types.InlineKeyboardButton("📬 Whitesub: получить конфиги", callback_data="cmd:whitesub_deploy"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("📋 Список", callback_data="cmd:list"),
+        telebot.types.InlineKeyboardButton("📊 Мониторинг", callback_data="cmd:monitor"),
+    )
+    return kb
+
+
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     bot.reply_to(
         message,
         "🔐 *VPN Бот*\n\n"
         "Привет! Я помогу получить конфиг для подключения к VPN.\n\n"
+        "Жми на кнопки ниже или пользуйся командами напрямую (`/menu`, чтобы вызвать кнопки ещё раз):\n\n"
         "*/new* — сгенерировать новый профиль и получить `.ovpn` файл\n"
         "*/white* `[jitsi-сервер]` — поднять запасной туннель через белые списки (Jitsi/WebRTC), для случаев когда обычный VPN режут\n"
         f"  по умолчанию `{get_default_jitsi_instance()}`, можно указать свой: `/white meet.small-dm.ru`\n"
@@ -523,9 +563,53 @@ def handle_start(message):
         "  пришли имя конфига из списка (например `user_cd89c7` или `olcrtc-68518b35`), чтобы получить его заново — ответь на это сообщение текстом, чтобы задать имя, видимое в /list\n"
         "*/whitesub* `-setup [N]` — прогоняет оба скана (как `-best_all -test`), присылает полный список и ждёт от тебя номера позиций, которые реально работают в твоей сети — ответь на сообщение-приглашение номерами через запятую/пробел, сохранит лучшие N из подтверждённых как пул (по умолчанию N=5), туннели пока не поднимает; добавь `-checkoff`, чтобы пропустить проверку анонимного XMPP-логина\n"
         "*/whitesub* `[N]` — поднимает N туннелей из сохранённого пула (по умолчанию N=5), одним сообщением присылает все конфиги подписки, затем файл подписки и `https` ссылку на неё (для импорта в olcbox: добавление конфигурации → импорт из файла или ввод ссылки, для ссылки нужно включить `Allow insecure requests` - сертификат самоподписанный). У подписки есть свой id и имя (по умолчанию `WhiteLite`) - ответь на сводное сообщение текстом, чтобы переименовать\n"
-        "*/start* — показать это сообщение",
-        parse_mode="Markdown"
+        "*/start* — показать это сообщение\n"
+        "*/menu* — показать кнопки меню",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
     )
+
+
+@bot.message_handler(commands=['menu'])
+def handle_menu(message):
+    if not is_admin(message):
+        return
+    bot.reply_to(message, "📋 Меню:", reply_markup=main_menu_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cmd:"))
+def handle_menu_callback(call):
+    bot.answer_callback_query(call.id)
+    if call.from_user.id != ADMIN_TELEGRAM_ID:
+        return  # молча игнорируем не-админов
+
+    action = call.data[len("cmd:"):]
+    fake = FakeMessage(call.message.chat.id, call.from_user.id, "", call.message.message_id)
+
+    try:
+        if action == "new":
+            handle_new_vpn(fake)
+        elif action == "white":
+            fake.text = "/white"
+            handle_white(fake)
+        elif action == "white_best_all":
+            fake.text = "/white -best_all"
+            handle_white(fake)
+        elif action == "whitesub_setup":
+            fake.text = "/whitesub -setup"
+            handle_whitesub(fake)
+        elif action == "whitesub_deploy":
+            fake.text = "/whitesub"
+            handle_whitesub(fake)
+        elif action == "list":
+            handle_list(fake)
+        elif action == "monitor":
+            handle_monitor(fake)
+    except Exception as e:
+        try:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+        except Exception:
+            pass
 
 @bot.message_handler(commands=['new'])
 def handle_new_vpn(message):
