@@ -43,8 +43,11 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 NET_SAMPLE_INTERVAL = 0.1     # сек, ~100мс - как на сервере, с которого скопирован формат
 NET_SHORT_MAXLEN = 3000       # окно для avg/peak в /monitor (~5 минут при 100мс)
-NET_DAILY_SAMPLE_INTERVAL_SEC = 38 * 60   # редкие точки для суточного графика
+NET_DAILY_SAMPLE_INTERVAL_SEC_DEFAULT = 38 * 60   # шаг суточного графика по умолчанию
+NET_DAILY_SAMPLE_INTERVAL_MIN_SEC = 60      # 1 минута - минимум, который просили разрешить
+NET_DAILY_SAMPLE_INTERVAL_MAX_SEC = 180 * 60
 NET_DAILY_WINDOW_SEC = 24 * 3600
+NET_DAILY_GRAPH_MAX_ROWS = 60  # если сэмплов больше (мелкий шаг) - график прореживается
 
 OLCRTC_IMAGE = "olcrtc-server:latest"
 OLCRTC_JITSI_INSTANCE = "meet.egovm.ru"  # проверено вручную, что открывается в белых списках
@@ -76,6 +79,7 @@ WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, т�
 WHITESUB_SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "whitesub_subscriptions.json")
 # {"active_id": "wsub-xxxx", "subscriptions": {"wsub-xxxx": {"name","token","last_text","created_at"}}}
 NET_DAILY_HISTORY_FILE = os.path.join(DATA_DIR, "net_daily_history.json")
+NET_DAILY_INTERVAL_FILE = os.path.join(DATA_DIR, "net_daily_interval.json")  # {"interval_sec": N}
 
 SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
 SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
@@ -110,6 +114,11 @@ pending_whitesub_config = {}
 
 # message_id сообщения "Конфигурация White" -> True, для замены домена по умолчанию по reply.
 pending_white_config = {}
+
+# message_id второго сообщения /monitor (суточный график) -> True, для установки
+# шага записи (в минутах) по reply. Разовое действие - настройка живёт до
+# следующего изменения, а не сбрасывается сама.
+pending_net_graph_interval = {}
 
 
 def is_admin(message):
@@ -1935,8 +1944,43 @@ def sample_net_interfaces():
     }
 
 
+def get_net_daily_interval_sec():
+    data = load_json_file(NET_DAILY_INTERVAL_FILE, None)
+    if data and data.get("interval_sec"):
+        return data["interval_sec"]
+    return NET_DAILY_SAMPLE_INTERVAL_SEC_DEFAULT
+
+
+def set_net_daily_interval_minutes(minutes):
+    seconds = max(NET_DAILY_SAMPLE_INTERVAL_MIN_SEC, min(NET_DAILY_SAMPLE_INTERVAL_MAX_SEC, minutes * 60))
+    save_json_file(NET_DAILY_INTERVAL_FILE, {"interval_sec": seconds})
+    return seconds
+
+
+def handle_net_graph_interval_reply(message):
+    text = message.text.strip()
+    try:
+        minutes = int(text)
+    except ValueError:
+        bot.reply_to(message, "⛔ Пришли целое число минут, например `5`.", parse_mode="Markdown")
+        return
+    if minutes <= 0:
+        bot.reply_to(message, "⛔ Шаг должен быть положительным числом минут.")
+        return
+
+    seconds = set_net_daily_interval_minutes(minutes)
+    note = ""
+    if seconds != minutes * 60:
+        note = f" (ограничил диапазоном {NET_DAILY_SAMPLE_INTERVAL_MIN_SEC // 60}-{NET_DAILY_SAMPLE_INTERVAL_MAX_SEC // 60} мин)"
+    bot.reply_to(
+        message,
+        f"✅ Шаг записи графика теперь {seconds // 60} мин{note}. "
+        "Уже сохранённые точки останутся как есть, новые пойдут с этим шагом."
+    )
+
+
 def maybe_record_daily_sample(sample):
-    if sample["time"] - _last_daily_sample_at["t"] < NET_DAILY_SAMPLE_INTERVAL_SEC:
+    if sample["time"] - _last_daily_sample_at["t"] < get_net_daily_interval_sec():
         return
     _last_daily_sample_at["t"] = sample["time"]
     history = load_json_file(NET_DAILY_HISTORY_FILE, [])
@@ -2034,9 +2078,17 @@ def render_daily_rx_graph():
     if not points:
         return f"{header}\nНедостаточно данных, собираю (нужно подождать несколько часов)."
 
+    thinned = False
+    if len(points) > NET_DAILY_GRAPH_MAX_ROWS:
+        step = -(-len(points) // NET_DAILY_GRAPH_MAX_ROWS)  # ceil-деление
+        points = points[::step]
+        thinned = True
+
     max_mbps = max(p[1] for p in points) or 1e-9
+    interval_min = get_net_daily_interval_sec() / 60
     lines = [
         header,
+        f"шаг записи: {interval_min:g} мин" + (" (график прорежен, чтобы уложиться в сообщение)" if thinned else ""),
         f"полный бар = {max_mbps:.2f} Mbps ({max_mbps / BW_LIMIT_MBPS * 100:.2f}% от 1Gbit/s)",
         "",
     ]
@@ -2383,9 +2435,12 @@ def handle_monitor(message):
         text = "\n".join(lines)
         bot.delete_message(message.chat.id, msg.message_id)
         bot.send_message(message.chat.id, text, parse_mode="Markdown")
-        bot.send_message(
-            message.chat.id, "```\n" + render_daily_rx_graph() + "\n```", parse_mode="Markdown"
+        graph_msg = bot.send_message(
+            message.chat.id,
+            "```\n" + render_daily_rx_graph() + "\n```\nОтветь числом (минуты), чтобы задать шаг записи графика.",
+            parse_mode="Markdown"
         )
+        pending_net_graph_interval[graph_msg.message_id] = True
 
     except Exception as e:
         bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, msg.message_id)
@@ -2532,6 +2587,10 @@ def handle_text(message):
 
             if reply_id in pending_white_config:
                 handle_white_config_reply(message)
+                return
+
+            if reply_id in pending_net_graph_interval:
+                handle_net_graph_interval_reply(message)
                 return
 
             if reply_id in pending_rename:
