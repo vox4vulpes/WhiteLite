@@ -2115,7 +2115,7 @@ def render_openvpn_online_block():
     lines = [f"🛡️  OpenVPN: {len(clients)}"]
     for c in clients:
         alias = names_map.get(c["name"])
-        label = f"{alias}  ({c['name']})" if alias else c["name"]
+        label = f"`{alias}`  `{c['name']}`" if alias else f"`{c['name']}`"
         recv_mb = c["bytes_recv"] / (1024 ** 2)
         sent_mb = c["bytes_sent"] / (1024 ** 2)
         lines.append(f"  • {label}  ↓{recv_mb:.1f}/↑{sent_mb:.1f} MB")
@@ -2135,7 +2135,7 @@ def render_white_online_block():
     lines = [f"🌐  White: {len(active)}"]
     for r in active:
         alias = names_map.get(r["name"])
-        label = f"{alias}  ({r['name']})" if alias else r["name"]
+        label = f"`{alias}`  `{r['name']}`" if alias else f"`{r['name']}`"
         recv_mb = r["bytes_recv"] / (1024 ** 2)
         sent_mb = r["bytes_sent"] / (1024 ** 2)
         lines.append(f"  • {label}  ↓{recv_mb:.1f}/↑{sent_mb:.1f} MB")
@@ -2380,7 +2380,7 @@ def handle_monitor(message):
         lines.append("─" * 30)
         lines.append(f"⏱️  {datetime.now(MSK_TZ).strftime('%H:%M:%S %d.%m.%Y')}")
 
-        text = "```\n" + "\n".join(lines) + "\n```"
+        text = "\n".join(lines)
         bot.delete_message(message.chat.id, msg.message_id)
         bot.send_message(message.chat.id, text, parse_mode="Markdown")
         bot.send_message(
