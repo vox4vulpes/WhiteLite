@@ -87,6 +87,10 @@ pending_whitesub_setup = {}
 # message_id сводного сообщения /whitesub -> True, для переименования подписки по reply.
 pending_whitesub_rename = {}
 
+# message_id сообщения со списком "Конфигурация" -> True, для добавления/удаления
+# серверов по reply. Не удаляется после ответа - можно отвечать многократно.
+pending_whitesub_config = {}
+
 
 def is_admin(message):
     return message.from_user.id == ADMIN_TELEGRAM_ID
@@ -129,11 +133,34 @@ def save_white_config(container_name, data):
 
 
 def get_whitesub_pool():
-    return load_json_file(WHITESUB_POOL_FILE, {}).get("hosts", [])
+    """Список {"host","checks"}. Поддерживает и старый формат (просто список
+    строк-доменов, до появления аннотаций проверок) - оборачивает на лету."""
+    raw = load_json_file(WHITESUB_POOL_FILE, {}).get("hosts", [])
+    return [
+        entry if isinstance(entry, dict) else {"host": entry, "checks": None}
+        for entry in raw
+    ]
 
 
-def save_whitesub_pool(hosts):
-    save_json_file(WHITESUB_POOL_FILE, {"hosts": hosts, "updated_at": time.time()})
+def save_whitesub_pool(entries):
+    save_json_file(WHITESUB_POOL_FILE, {"hosts": entries, "updated_at": time.time()})
+
+
+def add_whitesub_pool_host(host, checks):
+    pool = get_whitesub_pool()
+    pool.append({"host": host, "checks": checks})
+    save_whitesub_pool(pool)
+
+
+def remove_whitesub_pool_at(position):
+    """position - 1-based индекс, как в отображаемом списке. Возвращает
+    удалённую запись или None, если позиция вне диапазона."""
+    pool = get_whitesub_pool()
+    if not (1 <= position <= len(pool)):
+        return None
+    removed = pool.pop(position - 1)
+    save_whitesub_pool(pool)
+    return removed
 
 
 def _migrate_legacy_whitesub_subscription():
@@ -617,11 +644,23 @@ def main_menu_keyboard():
 def whitesub_submenu_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        telebot.types.InlineKeyboardButton("🆕 Новая подписка", callback_data="cmd:whitesub_new"),
+        telebot.types.InlineKeyboardButton("🆕 Новая подписка", callback_data="cmd:whitesub_new_menu"),
         telebot.types.InlineKeyboardButton("📚 Список", callback_data="cmd:whitesub_list"),
     )
     kb.add(
         telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:menu_main"),
+    )
+    return kb
+
+
+def whitesub_new_submenu_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        telebot.types.InlineKeyboardButton("➕", callback_data="cmd:whitesub_new_create"),
+        telebot.types.InlineKeyboardButton("⚙️ Конфигурация", callback_data="cmd:whitesub_config"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:whitesub_menu"),
     )
     return kb
 
@@ -686,6 +725,26 @@ def handle_menu_callback(call):
                 reply_markup=main_menu_keyboard()
             )
             return
+        elif action == "whitesub_new_menu":
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=whitesub_new_submenu_keyboard()
+            )
+            return
+        elif action == "whitesub_new_create":
+            handle_whitesub_new_create(fake)
+        elif action == "whitesub_config":
+            send_whitesub_config(call.message.chat.id)
+        elif action == "whitesub_config_reset":
+            bot.edit_message_text(
+                "⚠️ Точно стереть текущую конфигурацию серверов и пересканировать с нуля?",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=whitesub_config_reset_confirm_keyboard()
+            )
+            return
+        elif action == "whitesub_config_reset_confirm":
+            fake.text = f"/whitesub -setup {WHITESUB_DEFAULT_COUNT}"
+            handle_whitesub(fake)
         elif action == "new":
             handle_new_vpn(fake)
         elif action == "white":
@@ -694,9 +753,6 @@ def handle_menu_callback(call):
         elif action == "white_best_all":
             fake.text = "/white -best_all"
             handle_white(fake)
-        elif action == "whitesub_new":
-            fake.text = "/whitesub -new"
-            handle_whitesub(fake)
         elif action == "whitesub_list":
             fake.text = "/whitesub -list"
             handle_whitesub(fake)
@@ -1226,6 +1282,88 @@ def handle_whitesub_use(message, sub_id):
     bot.reply_to(message, f"✅ Активная подписка теперь: {sub['name']} (`{sub_id}`)", parse_mode="Markdown")
 
 
+def format_whitesub_config_text():
+    pool = get_whitesub_pool()
+    lines = ["⚙️ *Конфигурация серверов* (пул для новых подписок):"]
+    if not pool:
+        lines.append("_пусто_")
+    for i, entry in enumerate(pool, 1):
+        suffix = f" ({entry['checks']})" if entry.get("checks") else ""
+        lines.append(f"{i}. `{entry['host']}`{suffix}")
+    lines.append(
+        "\nОтветь на это сообщение доменом Jitsi-сервера, чтобы добавить его "
+        "(пройдёт проверку anon-login, результат допишется в скобках).\n"
+        "Ответь `-N` (например `-2`), чтобы удалить позицию N."
+    )
+    return "\n".join(lines)
+
+
+def whitesub_config_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton("🔄 Настроить с 0", callback_data="cmd:whitesub_config_reset"))
+    kb.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:whitesub_new_menu"))
+    return kb
+
+
+def whitesub_config_reset_confirm_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton(
+        "✅ Да, стереть и пересканировать", callback_data="cmd:whitesub_config_reset_confirm"
+    ))
+    kb.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="cmd:whitesub_config"))
+    return kb
+
+
+def send_whitesub_config(chat_id):
+    sent = bot.send_message(
+        chat_id, format_whitesub_config_text(),
+        parse_mode="Markdown", reply_markup=whitesub_config_keyboard()
+    )
+    pending_whitesub_config[sent.message_id] = True
+
+
+def handle_whitesub_config_reply(message):
+    text = message.text.strip()
+
+    m = re.fullmatch(r'-(\d+)', text)
+    if m:
+        position = int(m.group(1))
+        removed = remove_whitesub_pool_at(position)
+        if removed is None:
+            bot.reply_to(message, f"⛔ Нет позиции {position} в текущем списке.")
+        else:
+            bot.reply_to(message, f"🗑 Удалено: `{removed['host']}`", parse_mode="Markdown")
+        send_whitesub_config(message.chat.id)
+        return
+
+    host, error = sanitize_jitsi_host(text)
+    if error:
+        bot.reply_to(message, error, parse_mode="Markdown")
+        return
+
+    status = bot.reply_to(message, f"⏳ Проверяю `{host}`...", parse_mode="Markdown")
+    ok = check_jitsi_anonymous_login(host)
+    checks = "anon-login: ok" if ok else "anon-login: fail"
+    add_whitesub_pool_host(host, checks)
+    bot.edit_message_text(
+        f"✅ Добавлено: `{host}` ({checks})", message.chat.id, status.message_id, parse_mode="Markdown"
+    )
+    send_whitesub_config(message.chat.id)
+
+
+def handle_whitesub_new_create(message):
+    pool = get_whitesub_pool()
+    if not pool:
+        bot.reply_to(
+            message,
+            "❌ Конфигурация пуста. Сначала добавь серверы через ⚙️ Конфигурация.",
+            parse_mode="Markdown"
+        )
+        return
+    create_whitesub_subscription()
+    handle_whitesub_deploy(message, len(pool))
+
+
 def build_whitesub_text(entries, sub_id, sub):
     """entries: список (container_name, cfg). Формат совпадает с sub.md из olcRTC -
     plain text с #-глобальными полями и ##-локальными полями под каждым olcrtc://."""
@@ -1250,7 +1388,7 @@ def handle_whitesub_deploy(message, count):
         )
         return
 
-    hosts = pool[:count]
+    hosts = [entry["host"] for entry in pool[:count]]
     note = f" (в пуле только {len(pool)}, поднимаю все)" if count > len(pool) else ""
 
     status = bot.reply_to(message, f"⏳ Поднимаю {len(hosts)} туннелей из пула{note}...")
@@ -1389,6 +1527,7 @@ def handle_whitesub_setup(message, count, check_anonymous_login=True):
     pending_whitesub_setup[prompt.message_id] = {
         "combined": combined,
         "count": count,
+        "checked": check_anonymous_login,
     }
 
 
@@ -1396,6 +1535,7 @@ def process_whitesub_setup_reply(message, reply_id):
     data = pending_whitesub_setup.pop(reply_id)
     combined = data["combined"]
     count = data["count"]
+    checked = data.get("checked", True)
     total = len(combined)
 
     positions = []
@@ -1416,7 +1556,11 @@ def process_whitesub_setup_reply(message, reply_id):
 
     chosen_positions = valid_positions[:count]
     skipped_over_limit = valid_positions[count:]
-    hosts = [combined[p - 1][0] for p in chosen_positions]
+    checks_label = "anon-login: ok" if checked else "не проверялось (-checkoff)"
+    hosts = [
+        {"host": combined[p - 1][0], "checks": checks_label}
+        for p in chosen_positions
+    ]
 
     save_whitesub_pool(hosts)
 
@@ -1833,6 +1977,10 @@ def handle_text(message):
                     bot.reply_to(message, f"✅ Имя подписки `{sub_id}` обновлено: {name}", parse_mode="Markdown")
                 else:
                     bot.reply_to(message, f"⛔ Подписка `{sub_id}` больше не существует.", parse_mode="Markdown")
+                return
+
+            if reply_id in pending_whitesub_config:
+                handle_whitesub_config_reply(message)
                 return
 
             if reply_id in pending_rename:
