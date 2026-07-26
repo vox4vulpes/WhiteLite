@@ -1282,17 +1282,25 @@ def handle_whitesub_use(message, sub_id):
     bot.reply_to(message, f"✅ Активная подписка теперь: {sub['name']} (`{sub_id}`)", parse_mode="Markdown")
 
 
+WHITESUB_CHECK_EMOJI = {"ok": "✅", "fail": "❌", "skipped": "❔"}
+
+
 def format_whitesub_config_text():
     pool = get_whitesub_pool()
     lines = ["⚙️ *Конфигурация серверов* (пул для новых подписок):"]
     if not pool:
         lines.append("_пусто_")
     for i, entry in enumerate(pool, 1):
-        suffix = f" ({entry['checks']})" if entry.get("checks") else ""
-        lines.append(f"{i}. `{entry['host']}`{suffix}")
+        emoji = WHITESUB_CHECK_EMOJI.get(entry.get("checks"), "❔")
+        lines.append(f"{i}. {emoji} `{entry['host']}`")
+    lines.append(
+        "\n✅ анонимный вход в Jitsi подтверждён · "
+        "❌ анонимный вход не прошёл · "
+        "❔ не проверялось"
+    )
     lines.append(
         "\nОтветь на это сообщение доменом Jitsi-сервера, чтобы добавить его "
-        "(пройдёт проверку anon-login, результат допишется в скобках).\n"
+        "(пройдёт проверку anon-login).\n"
         "Ответь `-N` (например `-2`), чтобы удалить позицию N."
     )
     return "\n".join(lines)
@@ -1343,10 +1351,10 @@ def handle_whitesub_config_reply(message):
 
     status = bot.reply_to(message, f"⏳ Проверяю `{host}`...", parse_mode="Markdown")
     ok = check_jitsi_anonymous_login(host)
-    checks = "anon-login: ok" if ok else "anon-login: fail"
+    checks = "ok" if ok else "fail"
     add_whitesub_pool_host(host, checks)
     bot.edit_message_text(
-        f"✅ Добавлено: `{host}` ({checks})", message.chat.id, status.message_id, parse_mode="Markdown"
+        f"{WHITESUB_CHECK_EMOJI[checks]} Добавлено: `{host}`", message.chat.id, status.message_id, parse_mode="Markdown"
     )
     send_whitesub_config(message.chat.id)
 
@@ -1556,7 +1564,7 @@ def process_whitesub_setup_reply(message, reply_id):
 
     chosen_positions = valid_positions[:count]
     skipped_over_limit = valid_positions[count:]
-    checks_label = "anon-login: ok" if checked else "не проверялось (-checkoff)"
+    checks_label = "ok" if checked else "skipped"
     hosts = [
         {"host": combined[p - 1][0], "checks": checks_label}
         for p in chosen_positions
