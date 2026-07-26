@@ -73,7 +73,7 @@ WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_
 DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
 WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [...], "updated_at": ts}
 JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
-JITSI_SCORES_FILE = os.path.join(DATA_DIR, "jitsi_scores.json")  # {host: manual_score}
+JITSI_TABLE_FILE = os.path.join(DATA_DIR, "jitsi_table.json")  # {host: {"speed_mbps", "manual"}}
 WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # legacy, только для миграции
 WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # legacy, только для миграции
 WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, только для миграции
@@ -423,20 +423,44 @@ def add_to_jitsi_denylist(host):
         save_json_file(JITSI_DENYLIST_FILE, {"hosts": hosts})
 
 
-def get_jitsi_scores():
-    """Ручные оценки серверов {host: score} - админ сам решает, что реально
-    работает (отвечая на "Список серверов" строкой вида `домен +1`/`домен -1`),
-    в отличие от автоматических латентность/скорость метрик. Персистентно
-    добавляется к автосчёту в compute_combined_scores и влияет на сортировку
-    во всех местах, где он используется (в т.ч. на выбор при реальном деплое)."""
-    return load_json_file(JITSI_SCORES_FILE, {})
+def get_jitsi_table():
+    """Персистентная таблица "Список серверов": {host: {"speed_mbps", "manual"}}.
+    Первичный балл - реальная измеренная скорость (Mbps), всё остальное -
+    ручная оценка админа (см. handle_jitsi_score_reply). Скан только ДОБАВЛЯЕТ
+    новые хосты (add_new_hosts_to_jitsi_table) - существующие записи не
+    перезаписывает, чтобы не затирать уже накопленную ручную правку."""
+    return load_json_file(JITSI_TABLE_FILE, {})
 
 
-def adjust_jitsi_score(host, delta):
-    scores = get_jitsi_scores()
-    scores[host] = scores.get(host, 0) + delta
-    save_json_file(JITSI_SCORES_FILE, scores)
-    return scores[host]
+def save_jitsi_table(table):
+    save_json_file(JITSI_TABLE_FILE, table)
+
+
+def jitsi_table_total(entry):
+    return entry.get("speed_mbps", 0.0) + entry.get("manual", 0)
+
+
+def add_new_hosts_to_jitsi_table(speed_results):
+    """speed_results: [(host, mbps), ...]. Добавляет только хосты, которых ещё
+    нет в таблице, с их измеренной скоростью как первичным баллом. Возвращает
+    список реально добавленных хостов."""
+    table = get_jitsi_table()
+    added = []
+    for host, mbps in speed_results:
+        if host not in table:
+            table[host] = {"speed_mbps": round(mbps, 1), "manual": 0}
+            added.append(host)
+    if added:
+        save_jitsi_table(table)
+    return added
+
+
+def adjust_jitsi_table_manual(host, delta):
+    table = get_jitsi_table()
+    entry = table.setdefault(host, {"speed_mbps": 0.0, "manual": 0})
+    entry["manual"] = entry.get("manual", 0) + delta
+    save_jitsi_table(table)
+    return entry
 
 
 def handle_jitsi_score_reply(message):
@@ -454,8 +478,96 @@ def handle_jitsi_score_reply(message):
         bot.reply_to(message, error, parse_mode="Markdown")
         return
 
-    new_score = adjust_jitsi_score(host, int(m.group(2)))
-    bot.reply_to(message, f"✅ `{host}`: ручная оценка теперь {new_score:+d}.", parse_mode="Markdown")
+    entry = adjust_jitsi_table_manual(host, int(m.group(2)))
+    bot.reply_to(
+        message,
+        f"✅ `{host}`: счёт теперь {jitsi_table_total(entry):.1f} "
+        f"(скорость {entry.get('speed_mbps', 0):.1f} + оценка {entry.get('manual', 0):+d}).",
+        parse_mode="Markdown"
+    )
+    send_jitsi_table(message.chat.id)
+
+
+def format_jitsi_table():
+    table = get_jitsi_table()
+    if not table:
+        return (
+            "📋 *Список серверов* пуст.\n"
+            "Запусти скан одной из кнопок ниже, чтобы найти и добавить серверы."
+        )
+    rows = sorted(table.items(), key=lambda kv: jitsi_table_total(kv[1]), reverse=True)
+    lines = ["📋 *Список серверов* (счёт = скорость Mbps + ручная оценка):"]
+    for i, (host, entry) in enumerate(rows, start=1):
+        total = jitsi_table_total(entry)
+        manual = entry.get("manual", 0)
+        manual_part = f" (скорость {entry.get('speed_mbps', 0):.1f} + оценка {manual:+d})" if manual else ""
+        lines.append(f"{i}. `{host}` — счёт {total:.1f}{manual_part}")
+    lines.append(
+        "\nОтветь на это сообщение строкой `домен +1` / `домен -1`, "
+        "чтобы вручную скорректировать счёт (сохраняется навсегда)."
+    )
+    return "\n".join(lines)
+
+
+def jitsi_table_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton(
+        "⏱ Скан задержки (-best_ms)", callback_data="cmd:jtable_scan_ms"
+    ))
+    kb.add(telebot.types.InlineKeyboardButton(
+        "⚡ Скан скорости (-best_mb)", callback_data="cmd:jtable_scan_mb"
+    ))
+    kb.add(telebot.types.InlineKeyboardButton(
+        "🎯 Оба теста (-best_all)", callback_data="cmd:jtable_scan_all"
+    ))
+    return kb
+
+
+def send_jitsi_table(chat_id):
+    sent_msgs = send_long_message(chat_id, format_jitsi_table(), parse_mode="Markdown")
+    for m in sent_msgs:
+        pending_jitsi_score_reply[m.message_id] = True
+    bot.send_message(chat_id, "Действия:", reply_markup=jitsi_table_keyboard())
+
+
+def run_jitsi_table_scan(chat_id, mode):
+    """mode: 'ms' (только задержка), 'mb' (только скорость) или 'all' (оба).
+    Первичный балл - скорость, поэтому latency-only скан добавляет новые хосты
+    с primary=0 (найдены, но пока без измеренной скорости) - их можно поднять
+    позже реальным -best_mb/-best_all сканом или вручную оценкой."""
+    status = bot.send_message(chat_id, "🧮 Сканирую (может занять пару минут)...")
+    try:
+        hosts = fetch_jitsi_candidates(check_anonymous_login=True)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Не удалось получить список серверов: {e}", chat_id, status.message_id)
+        return
+
+    def noop_progress_cb(done, total, found):
+        pass
+
+    try:
+        added = []
+        if mode in ("mb", "all"):
+            speed_results, _ = scan_best_long_jitsi(noop_progress_cb, hosts=hosts)
+            added = add_new_hosts_to_jitsi_table(speed_results)
+        if mode == "ms":
+            latency_results, _ = scan_best_jitsi(noop_progress_cb, hosts=hosts)
+            table = get_jitsi_table()
+            new_hosts = [h for h, _ in latency_results if h not in table]
+            for h in new_hosts:
+                table[h] = {"speed_mbps": 0.0, "manual": 0}
+            if new_hosts:
+                save_jitsi_table(table)
+            added = new_hosts
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка сканирования: {e}", chat_id, status.message_id)
+        return
+
+    bot.edit_message_text(
+        f"✅ Просканировано {len(hosts)}. Новых серверов добавлено: {len(added)}.",
+        chat_id, status.message_id
+    )
+    send_jitsi_table(chat_id)
 
 
 def get_default_jitsi_instance():
@@ -881,8 +993,13 @@ def handle_menu_callback(call):
             active_id, _ = get_active_whitesub_subscription()
             send_whitesub_config(call.message.chat.id, active_id)
         elif action == "whitesub_config_scan":
-            fake.text = "/white -best_all -test"
-            handle_white(fake)
+            send_jitsi_table(call.message.chat.id)
+        elif action == "jtable_scan_ms":
+            run_jitsi_table_scan(call.message.chat.id, "ms")
+        elif action == "jtable_scan_mb":
+            run_jitsi_table_scan(call.message.chat.id, "mb")
+        elif action == "jtable_scan_all":
+            run_jitsi_table_scan(call.message.chat.id, "all")
         elif action == "new":
             handle_new_vpn(fake)
         elif action == "white_menu":
@@ -1180,8 +1297,8 @@ def compute_combined_scores(hosts, latency_results, speed_results):
     За каждый тест вычитается место хоста в этом тесте (1 место = -1 балл, N место = -N баллов),
     место в speed-тесте умножается на BEST_ALL_SPEED_WEIGHT.
     Хост, не ответивший в тесте, получает худшее возможное место (len(hosts)+1) в этом тесте.
-    К автосчёту прибавляется персистентная ручная оценка (get_jitsi_scores) - админ
-    сам вручную корректирует счёт по факту реальных подключений (см. /white -best_all -test).
+    К автосчёту прибавляется персистентная ручная оценка (get_jitsi_table) - админ
+    сам вручную корректирует счёт по факту реальных подключений.
     Возвращает список (host, score, latency_rank, latency_sec, speed_rank, mbps, manual_score),
     отсортированный по score по убыванию (выше = лучше)."""
     n = len(hosts)
@@ -1192,13 +1309,13 @@ def compute_combined_scores(hosts, latency_results, speed_results):
     latency_value = dict(latency_results)
     speed_rank = {host: i for i, (host, _) in enumerate(speed_results, start=1)}
     speed_value = dict(speed_results)
-    manual_scores = get_jitsi_scores()
+    jitsi_table = get_jitsi_table()
 
     combined = []
     for host in hosts:
         lr = latency_rank.get(host, worst_rank)
         sr = speed_rank.get(host, worst_rank)
-        manual = manual_scores.get(host, 0)
+        manual = jitsi_table.get(host, {}).get("manual", 0)
         score = initial_score - lr - (BEST_ALL_SPEED_WEIGHT * sr) + manual
         combined.append((
             host, score,
