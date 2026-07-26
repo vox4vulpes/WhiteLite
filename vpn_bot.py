@@ -710,6 +710,12 @@ def format_white_config_text():
 
 def white_config_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton(
+        "📋 Список серверов", callback_data="cmd:whitesub_config_scan"
+    ))
+    kb.add(telebot.types.InlineKeyboardButton(
+        "🔍 Проверить анонимный вход", callback_data="cmd:white_config_check"
+    ))
     kb.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:white_menu"))
     return kb
 
@@ -818,6 +824,17 @@ def handle_menu_callback(call):
             fake.text = "/white"
             handle_white(fake)
         elif action == "white_config":
+            send_white_config(call.message.chat.id)
+        elif action == "white_config_check":
+            host = get_default_jitsi_instance()
+            status = bot.send_message(
+                call.message.chat.id, f"⏳ Проверяю `{host}`...", parse_mode="Markdown"
+            )
+            ok = check_jitsi_anonymous_login(host)
+            emoji = WHITESUB_CHECK_EMOJI["ok" if ok else "fail"]
+            bot.edit_message_text(
+                f"{emoji} `{host}`", call.message.chat.id, status.message_id, parse_mode="Markdown"
+            )
             send_white_config(call.message.chat.id)
         elif action == "whitesub_list":
             fake.text = "/whitesub -list"
