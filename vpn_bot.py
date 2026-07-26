@@ -3,6 +3,7 @@ import subprocess
 import uuid
 import os
 import json
+import math
 import time
 import re
 import secrets
@@ -43,11 +44,10 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 NET_SAMPLE_INTERVAL = 0.1     # сек, ~100мс - как на сервере, с которого скопирован формат
 NET_SHORT_MAXLEN = 3000       # окно для avg/peak в /monitor (~5 минут при 100мс)
-NET_DAILY_SAMPLE_INTERVAL_SEC_DEFAULT = 38 * 60   # шаг суточного графика по умолчанию
-NET_DAILY_SAMPLE_INTERVAL_MIN_SEC = 60      # 1 минута - минимум, который просили разрешить
-NET_DAILY_SAMPLE_INTERVAL_MAX_SEC = 180 * 60
+NET_DAILY_SAMPLE_INTERVAL_SEC = 60   # фиксированная запись в 24ч-историю - раз в минуту, всегда
 NET_DAILY_WINDOW_SEC = 24 * 3600
-NET_DAILY_GRAPH_MAX_ROWS = 60  # если сэмплов больше (мелкий шаг) - график прореживается
+NET_DAILY_GRAPH_MAX_ROWS = 60  # жёсткий потолок строк графика
+NET_DAILY_GRAPH_DEFAULT_STEP_MIN = 30  # шаг по умолчанию, пока не попросили другой в reply
 
 OLCRTC_IMAGE = "olcrtc-server:latest"
 OLCRTC_JITSI_INSTANCE = "meet.egovm.ru"  # проверено вручную, что открывается в белых списках
@@ -79,7 +79,6 @@ WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, т�
 WHITESUB_SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "whitesub_subscriptions.json")
 # {"active_id": "wsub-xxxx", "subscriptions": {"wsub-xxxx": {"name","token","last_text","created_at"}}}
 NET_DAILY_HISTORY_FILE = os.path.join(DATA_DIR, "net_daily_history.json")
-NET_DAILY_INTERVAL_FILE = os.path.join(DATA_DIR, "net_daily_interval.json")  # {"interval_sec": N}
 
 SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
 SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
@@ -1944,19 +1943,6 @@ def sample_net_interfaces():
     }
 
 
-def get_net_daily_interval_sec():
-    data = load_json_file(NET_DAILY_INTERVAL_FILE, None)
-    if data and data.get("interval_sec"):
-        return data["interval_sec"]
-    return NET_DAILY_SAMPLE_INTERVAL_SEC_DEFAULT
-
-
-def set_net_daily_interval_minutes(minutes):
-    seconds = max(NET_DAILY_SAMPLE_INTERVAL_MIN_SEC, min(NET_DAILY_SAMPLE_INTERVAL_MAX_SEC, minutes * 60))
-    save_json_file(NET_DAILY_INTERVAL_FILE, {"interval_sec": seconds})
-    return seconds
-
-
 def handle_net_graph_interval_reply(message):
     text = message.text.strip()
     try:
@@ -1968,19 +1954,17 @@ def handle_net_graph_interval_reply(message):
         bot.reply_to(message, "⛔ Шаг должен быть положительным числом минут.")
         return
 
-    seconds = set_net_daily_interval_minutes(minutes)
-    note = ""
-    if seconds != minutes * 60:
-        note = f" (ограничил диапазоном {NET_DAILY_SAMPLE_INTERVAL_MIN_SEC // 60}-{NET_DAILY_SAMPLE_INTERVAL_MAX_SEC // 60} мин)"
-    bot.reply_to(
+    graph_text = render_daily_rx_graph(step_minutes=minutes)
+    sent = bot.reply_to(
         message,
-        f"✅ Шаг записи графика теперь {seconds // 60} мин{note}. "
-        "Уже сохранённые точки останутся как есть, новые пойдут с этим шагом."
+        "```\n" + graph_text + "\n```\nОтветь числом (минуты), чтобы прислать этот же график с другим шагом.",
+        parse_mode="Markdown"
     )
+    pending_net_graph_interval[sent.message_id] = True
 
 
 def maybe_record_daily_sample(sample):
-    if sample["time"] - _last_daily_sample_at["t"] < get_net_daily_interval_sec():
+    if sample["time"] - _last_daily_sample_at["t"] < NET_DAILY_SAMPLE_INTERVAL_SEC:
         return
     _last_daily_sample_at["t"] = sample["time"]
     history = load_json_file(NET_DAILY_HISTORY_FILE, [])
@@ -2052,7 +2036,42 @@ def render_iface_block(title, stats, show_utilization):
     return "\n".join(lines)
 
 
-def render_daily_rx_graph():
+def bucket_history_by_time(history, step_sec, window_sec):
+    """Разбивает окно [now-window_sec, now] на бакеты по step_sec и для каждого
+    считает Mbps по ближайшим сэмплам на его границах (не интерполяция - реальные
+    точки слева/справа от границы). history должна быть отсортирована по time."""
+    if len(history) < 2:
+        return []
+
+    end = history[-1]["time"]
+    start = end - window_sec
+
+    buckets = []
+    idx = 0
+    b_start = start
+    while b_start + step_sec <= end + 1e-6:
+        b_end = b_start + step_sec
+
+        left = None
+        while idx < len(history) and history[idx]["time"] <= b_start:
+            left = history[idx]
+            idx += 1
+        right_idx = idx
+        while right_idx < len(history) and history[right_idx]["time"] < b_end:
+            right_idx += 1
+        right = history[right_idx] if right_idx < len(history) else None
+
+        if left and right:
+            dt = right["time"] - left["time"]
+            drx = right["ext_rx"] - left["ext_rx"]
+            if dt > 0 and drx >= 0:
+                buckets.append((b_end, (drx * 8 / dt) / 1_000_000))
+
+        b_start = b_end
+    return buckets
+
+
+def render_daily_rx_graph(step_minutes=None):
     history = load_json_file(NET_DAILY_HISTORY_FILE, [])
     now = time.time()
     cutoff = now - NET_DAILY_WINDOW_SEC
@@ -2065,30 +2084,21 @@ def render_daily_rx_graph():
     if len(history) < 2:
         return f"{header}\nНедостаточно данных, собираю (нужно подождать несколько часов)."
 
-    points = []
-    for prev, cur in zip(history, history[1:]):
-        dt = cur["time"] - prev["time"]
-        if dt <= 0:
-            continue
-        drx = cur["ext_rx"] - prev["ext_rx"]
-        if drx < 0:
-            continue
-        points.append((cur["time"], (drx * 8 / dt) / 1_000_000))
+    min_step_min = math.ceil((NET_DAILY_WINDOW_SEC / 60) / NET_DAILY_GRAPH_MAX_ROWS)
+    requested = step_minutes if step_minutes else NET_DAILY_GRAPH_DEFAULT_STEP_MIN
+    effective_step = max(requested, min_step_min)
 
+    points = bucket_history_by_time(history, effective_step * 60, NET_DAILY_WINDOW_SEC)
     if not points:
         return f"{header}\nНедостаточно данных, собираю (нужно подождать несколько часов)."
 
-    thinned = False
-    if len(points) > NET_DAILY_GRAPH_MAX_ROWS:
-        step = -(-len(points) // NET_DAILY_GRAPH_MAX_ROWS)  # ceil-деление
-        points = points[::step]
-        thinned = True
-
     max_mbps = max(p[1] for p in points) or 1e-9
-    interval_min = get_net_daily_interval_sec() / 60
+    step_note = f"шаг: {effective_step} мин"
+    if effective_step != requested:
+        step_note += f" (запрошенные {requested} дали бы больше {NET_DAILY_GRAPH_MAX_ROWS} строк за 24ч - увеличил)"
     lines = [
         header,
-        f"шаг записи: {interval_min:g} мин" + (" (график прорежен, чтобы уложиться в сообщение)" if thinned else ""),
+        step_note,
         f"полный бар = {max_mbps:.2f} Mbps ({max_mbps / BW_LIMIT_MBPS * 100:.2f}% от 1Gbit/s)",
         "",
     ]
@@ -2437,7 +2447,7 @@ def handle_monitor(message):
         bot.send_message(message.chat.id, text, parse_mode="Markdown")
         graph_msg = bot.send_message(
             message.chat.id,
-            "```\n" + render_daily_rx_graph() + "\n```\nОтветь числом (минуты), чтобы задать шаг записи графика.",
+            "```\n" + render_daily_rx_graph() + "\n```\nОтветь числом (минуты), чтобы прислать этот же график с другим шагом.",
             parse_mode="Markdown"
         )
         pending_net_graph_interval[graph_msg.message_id] = True
