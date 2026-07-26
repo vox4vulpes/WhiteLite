@@ -524,6 +524,129 @@ def filter_by_anonymous_login(hosts):
     return good
 
 
+TURN_CHECKER_IMAGE = "turn-checker:latest"
+JITSI_TURN_DEBUG_WAIT_SEC = 5      # сколько ждать появления TURN credentials в debug-логе
+JITSI_TURN_ALLOCATE_TIMEOUT = 8    # сек на сам TURN allocate-запрос
+JITSI_TURN_CHECK_WORKERS = 8       # конкурентность, без фанатизма
+
+
+def parse_turn_service_from_debug_log(log_text):
+    """Достаёт host/port/username/password TURN-сервиса из debug-лога olcrtc
+    (XEP-0215 extdisco ответ). Порядок атрибутов в XML не гарантирован (разные
+    Jitsi-серверы шлют их по-разному - port может стоять и до, и после
+    transport), а пароль сам может содержать '/' (base64) - поэтому берём
+    тег по границе '>' (её в атрибутах-значениях не бывает), а не жадно до
+    первого '/', и разбираем атрибуты как словарь, не полагаясь на порядок."""
+    m = re.search(r"<service type='turn'[^>]*/>", log_text)
+    if not m:
+        return None
+    attrs = dict(re.findall(r"(\w+)='([^']*)'", m.group(0)))
+    if attrs.get("transport") != "udp":
+        return None
+    host, port = attrs.get("host"), attrs.get("port")
+    username, password = attrs.get("username"), attrs.get("password")
+    if not all([host, port, username, password]):
+        return None
+    return host, port, username, password
+
+
+def is_private_relay_ip(ip_str):
+    try:
+        return ipaddress.ip_address(ip_str).is_private
+    except ValueError:
+        return False
+
+
+def check_jitsi_turn_relay(host):
+    """Проверяет, что TURN-сервер этого Jitsi-хоста отдаёт публичный relay-адрес,
+    а не приватный (частый баг конфигурации coturn - см. случай meet.geotec.ru,
+    у которого relay уходит на 10.x.x.x, недостижимый снаружи; клиент внешне
+    может даже "подключиться", но тут же рвётся без единого байта трафика).
+
+    check_jitsi_anonymous_login это не ловит - тот сидит в комнате один, без
+    реального пира, и не доходит до ICE/TURN вообще. Здесь credentials на TURN
+    достаём из debug-лога olcrtc (XMPP extdisco, не требует пира), а сам relay-
+    адрес получаем настоящим TURN Allocate через turnutils_uclient (из пакета
+    coturn) - тоже без необходимости в живом собеседнике.
+
+    Возвращает (ok: bool, detail: str)."""
+    container_name = f"olcrtc-turnprobe-{uuid.uuid4().hex[:8]}"
+    room_id = f"https://{host}/probe-{uuid.uuid4().hex[:8]}"
+    enc_key = os.urandom(32).hex()
+
+    logs = ""
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "-d", "--network", "host",
+                "--name", container_name,
+                "-e", f"ROOM_ID={room_id}",
+                "-e", f"ENC_KEY={enc_key}",
+                "-e", "PROVIDER=jitsi",
+                "-e", "TRANSPORT=datachannel",
+                "-e", "DEBUG=true",
+                OLCRTC_IMAGE,
+            ],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        deadline = time.monotonic() + JITSI_TURN_DEBUG_WAIT_SEC
+        while time.monotonic() < deadline:
+            logs_result = subprocess.run(
+                ["docker", "logs", container_name], capture_output=True, text=True, timeout=5
+            )
+            logs = logs_result.stdout + logs_result.stderr  # olcrtc пишет лог в stderr
+            if "type='turn'" in logs:
+                break
+            time.sleep(0.5)
+    except Exception as e:
+        return False, f"не удалось получить TURN credentials: {e}"
+    finally:
+        subprocess.run(["docker", "kill", container_name], capture_output=True, text=True)
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+
+    turn = parse_turn_service_from_debug_log(logs)
+    if not turn:
+        return False, "сервер не отдал TURN-сервис (extdisco)"
+
+    turn_host, turn_port, username, password = turn
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm", "--network", "host",
+                TURN_CHECKER_IMAGE,
+                "-u", username, "-w", password, "-p", turn_port, "-y", "-v", "-n", "1",
+                turn_host,
+            ],
+            capture_output=True, text=True, timeout=JITSI_TURN_ALLOCATE_TIMEOUT,
+        )
+        output = result.stdout + result.stderr
+    except Exception as e:
+        return False, f"TURN allocate не выполнился: {e}"
+
+    m = re.search(r"Received relay addr:\s*([\d.]+):", output)
+    if not m:
+        return False, "TURN allocate не вернул relay-адрес"
+
+    relay_ip = m.group(1)
+    if is_private_relay_ip(relay_ip):
+        return False, f"relay-адрес {relay_ip} приватный - недостижим снаружи"
+    return True, f"relay: {relay_ip}"
+
+
+def check_turn_relay_parallel(hosts):
+    """Возвращает {host: (ok, detail)} для всех hosts, параллельно."""
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_TURN_CHECK_WORKERS) as pool:
+        futures = {pool.submit(check_jitsi_turn_relay, h): h for h in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            host = futures[future]
+            try:
+                results[host] = future.result()
+            except Exception as e:
+                results[host] = (False, f"ошибка проверки: {e}")
+    return results
+
+
 def fetch_jitsi_candidates(check_anonymous_login=True):
     """Тянет список кандидатов, отбрасывая голые IP и хосты из denylist. Если
     check_anonymous_login=True (по умолчанию), дополнительно прогоняет реальную проверку
@@ -1160,12 +1283,16 @@ def compute_combined_scores(hosts, latency_results, speed_results):
     return combined
 
 
-def format_combined_results_list(combined):
+def format_combined_results_list(combined, turn_results=None):
     lines = []
     for i, (host, score, lr, lv, sr, sv) in enumerate(combined, start=1):
         ms_part = f"{lv * 1000:.0f} мс (#{lr})" if lr is not None else "нет ответа"
         mbps_part = f"{sv:.1f} Mbps (#{sr})" if sr is not None else "нет ответа"
-        lines.append(f"{i}. `{host}` — счёт {score}: {ms_part} / {mbps_part}")
+        line = f"{i}. `{host}` — счёт {score}: {ms_part} / {mbps_part}"
+        if turn_results and host in turn_results:
+            ok, detail = turn_results[host]
+            line += f" · TURN {'✅' if ok else '❌'} ({detail})"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -1311,6 +1438,26 @@ def handle_white_best_all(message, dry_run=False, check_anonymous_login=True):
     ms_part = f"{best_lv * 1000:.0f} мс (#{best_lr})" if best_lr is not None else "нет ответа"
     mbps_part = f"{best_sv:.1f} Mbps (#{best_sr})" if best_sr is not None else "нет ответа"
 
+    turn_results = None
+    if dry_run:
+        # Только аннотация, без авто-denylist: проверка изолированным TURN Allocate
+        # ловит реально сломанные серверы (see meet.geotec.ru - приватный relay-IP,
+        # подтверждено логом реального отказа), но даёт и ложные срабатывания на
+        # серверах, которые по факту работают (zgn-y-vc01.zignotch.com - реально
+        # использовался с настоящим трафиком, но тоже засветил приватный IP в
+        # этом тесте) - похоже, у части серверов есть другой рабочий путь,
+        # которого наш изолированный allocate не видит. Решение остаётся за
+        # админом, не автоматизируем исключение по одному этому сигналу.
+        checked_hosts = [c[0] for c in combined if c[2] is not None or c[4] is not None]
+        try:
+            bot.edit_message_text(
+                f"🧮 Проверяю TURN-relay ({len(checked_hosts)} серверов)...",
+                message.chat.id, msg.message_id
+            )
+            turn_results = check_turn_relay_parallel(checked_hosts)
+        except Exception:
+            turn_results = None
+
     bot.edit_message_text(
         f"✅ Просканировано {total}\n"
         f"🏆 Лучший: `{best_host}` — счёт {best_score}\n"
@@ -1322,7 +1469,8 @@ def handle_white_best_all(message, dry_run=False, check_anonymous_login=True):
 
     send_long_message(
         message.chat.id,
-        "📋 *Полный список (комбинированный балл):*\n" + format_combined_results_list(combined),
+        "📋 *Полный список (комбинированный балл):*\n"
+        + format_combined_results_list(combined, turn_results=turn_results),
         parse_mode="Markdown"
     )
 
