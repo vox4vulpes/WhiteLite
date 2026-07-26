@@ -91,6 +91,9 @@ pending_whitesub_rename = {}
 # серверов по reply. Не удаляется после ответа - можно отвечать многократно.
 pending_whitesub_config = {}
 
+# message_id сообщения "Конфигурация White" -> True, для замены домена по умолчанию по reply.
+pending_white_config = {}
+
 
 def is_admin(message):
     return message.from_user.id == ADMIN_TELEGRAM_ID
@@ -649,10 +652,7 @@ def main_menu_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         telebot.types.InlineKeyboardButton("🆕 Новый OpenVPN", callback_data="cmd:new"),
-        telebot.types.InlineKeyboardButton("🌐 White (по умолчанию)", callback_data="cmd:white"),
-    )
-    kb.add(
-        telebot.types.InlineKeyboardButton("🚀 White: авто-подбор", callback_data="cmd:white_best_all"),
+        telebot.types.InlineKeyboardButton("🌐 White", callback_data="cmd:white_menu"),
     )
     kb.add(
         telebot.types.InlineKeyboardButton("📦 Whitesub", callback_data="cmd:whitesub_menu"),
@@ -686,6 +686,50 @@ def whitesub_new_submenu_keyboard():
         telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:whitesub_menu"),
     )
     return kb
+
+
+def white_submenu_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        telebot.types.InlineKeyboardButton("➕", callback_data="cmd:white_create"),
+        telebot.types.InlineKeyboardButton("⚙️ Конфигурация", callback_data="cmd:white_config"),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:menu_main"),
+    )
+    return kb
+
+
+def format_white_config_text():
+    host = get_default_jitsi_instance()
+    return (
+        f"⚙️ *Конфигурация White* - сервер по умолчанию:\n`{host}`\n\n"
+        "Ответь на это сообщение доменом Jitsi-сервера, чтобы заменить его."
+    )
+
+
+def white_config_keyboard():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:white_menu"))
+    return kb
+
+
+def send_white_config(chat_id):
+    sent = bot.send_message(
+        chat_id, format_white_config_text(),
+        parse_mode="Markdown", reply_markup=white_config_keyboard()
+    )
+    pending_white_config[sent.message_id] = True
+
+
+def handle_white_config_reply(message):
+    host, error = sanitize_jitsi_host(message.text.strip())
+    if error:
+        bot.reply_to(message, error, parse_mode="Markdown")
+        return
+    set_default_jitsi_instance(host)
+    bot.reply_to(message, f"✅ Домен по умолчанию для `/white` теперь `{host}`", parse_mode="Markdown")
+    send_white_config(message.chat.id)
 
 
 @bot.message_handler(commands=['start'])
@@ -764,12 +808,17 @@ def handle_menu_callback(call):
             handle_white(fake)
         elif action == "new":
             handle_new_vpn(fake)
-        elif action == "white":
+        elif action == "white_menu":
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=white_submenu_keyboard()
+            )
+            return
+        elif action == "white_create":
             fake.text = "/white"
             handle_white(fake)
-        elif action == "white_best_all":
-            fake.text = "/white -best_all"
-            handle_white(fake)
+        elif action == "white_config":
+            send_white_config(call.message.chat.id)
         elif action == "whitesub_list":
             fake.text = "/whitesub -list"
             handle_whitesub(fake)
@@ -2092,6 +2141,10 @@ def handle_text(message):
 
             if reply_id in pending_whitesub_config:
                 handle_whitesub_config_reply(message, pending_whitesub_config[reply_id])
+                return
+
+            if reply_id in pending_white_config:
+                handle_white_config_reply(message)
                 return
 
             if reply_id in pending_rename:
