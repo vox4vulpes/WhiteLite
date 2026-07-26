@@ -978,7 +978,12 @@ def create_white_tunnel(jitsi_instance, source="white"):
     subprocess.run([
         "docker", "run", "-d",
         "--name", container_name,
-        "--network", "host",
+        # без --network host: даёт Docker'у вести отдельный сетевой счётчик на
+        # контейнер (docker stats), что и нужно для трафика клиента. olcrtc
+        # только сам куда-то дозванивается (XMPP-сигналинг + WebRTC/ICE
+        # исходящим UDP) - входящих портов наружу не публикует, а исходящий
+        # NAT обычного bridge-network Docker для этого достаточен (проверено
+        # вручную: MUC join и реальный datachannel-трафик оба отработали).
         "--restart", "unless-stopped",
         "-e", f"ROOM_ID={room_id}",
         "-e", f"ENC_KEY={enc_key}",
@@ -2117,6 +2122,26 @@ def render_openvpn_online_block():
     return "\n".join(lines)
 
 
+def render_white_online_block():
+    """Только те White-туннели, у которых реально был трафик (докер-контейнеры
+    поднятые ещё в старом --network host режиме тут всегда 0/0 - не баг, у них
+    просто нет отдельного сетевого счётчика, см. list_white_containers())."""
+    try:
+        rows = list_white_containers()
+    except Exception:
+        rows = []
+    active = [r for r in rows if r["bytes_recv"] + r["bytes_sent"] > 0]
+    names_map = get_client_names()
+    lines = [f"🌐  White: {len(active)}"]
+    for r in active:
+        alias = names_map.get(r["name"])
+        label = f"{alias}  ({r['name']})" if alias else r["name"]
+        recv_mb = r["bytes_recv"] / (1024 ** 2)
+        sent_mb = r["bytes_sent"] / (1024 ** 2)
+        lines.append(f"  • {label}  ↓{recv_mb:.1f}/↑{sent_mb:.1f} MB")
+    return "\n".join(lines)
+
+
 def list_openvpn_clients():
     """Все клиентские сертификаты, когда-либо выданные ботом (/new).
     Сервер сам себе тоже выдаёт сертификат (CN=IP) - он не начинается с "user_",
@@ -2192,10 +2217,30 @@ def format_uptime(seconds):
     return f"{s}с"
 
 
+def parse_docker_size(s):
+    """'397kB' -> байты. Docker (go-units) форматирует decimal-единицами (kB=1000B)."""
+    m = re.match(r'^([\d.]+)\s*([a-zA-Z]*)$', s.strip())
+    if not m:
+        return 0
+    value = float(m.group(1))
+    multipliers = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4, "PB": 1000 ** 5}
+    return value * multipliers.get(m.group(2).upper(), 1)
+
+
+def parse_docker_net_io(s):
+    """Формат {{.NetIO}}: 'RX / TX', например '397kB / 394kB'."""
+    parts = s.split("/")
+    if len(parts) != 2:
+        return 0, 0
+    return int(parse_docker_size(parts[0])), int(parse_docker_size(parts[1]))
+
+
 def list_white_containers():
-    """Живые white-туннели (olcrtc-контейнеры). Работают с --network host,
-    поэтому у Docker нет отдельного сетевого трафика на контейнер - вместо этого
-    показываем CPU% (как индикатор активности) и аптайм."""
+    """Живые white-туннели (olcrtc-контейнеры). С версии без --network host
+    Docker ведёт для них честный отдельный сетевой счётчик (docker stats) -
+    трафик показываем так же, как для OpenVPN-клиентов. Старые контейнеры,
+    поднятые ещё в host-режиме до этого изменения, у Docker трафика не имеют
+    (NetIO будет 0/0) - это ожидаемо, не баг."""
     result = subprocess.run(
         ["docker", "ps", "--filter", f"ancestor={OLCRTC_IMAGE}", "--format", "{{.Names}}"],
         capture_output=True, text=True, check=True
@@ -2205,14 +2250,14 @@ def list_white_containers():
         return []
 
     stats_result = subprocess.run(
-        ["docker", "stats", "--no-stream", "--format", "{{.Name}},{{.CPUPerc}}"] + names,
+        ["docker", "stats", "--no-stream", "--format", "{{.Name}},{{.CPUPerc}},{{.NetIO}}"] + names,
         capture_output=True, text=True, check=True
     )
-    cpu_by_name = {}
+    stats_by_name = {}
     for line in stats_result.stdout.strip().splitlines():
-        parts = line.split(",")
-        if len(parts) == 2:
-            cpu_by_name[parts[0]] = parts[1].strip().rstrip('%')
+        parts = line.split(",", 2)
+        if len(parts) == 3:
+            stats_by_name[parts[0]] = (parts[1].strip().rstrip('%'), parts[2].strip())
 
     rows = []
     for name in names:
@@ -2233,14 +2278,19 @@ def list_white_containers():
         except Exception:
             pass
 
+        cpu_str, net_io_str = stats_by_name.get(name, ("0", "0B / 0B"))
         try:
-            cpu_val = float(cpu_by_name.get(name, "0"))
+            cpu_val = float(cpu_str)
         except ValueError:
             cpu_val = 0.0
+        bytes_recv, bytes_sent = parse_docker_net_io(net_io_str)
 
-        rows.append({"name": name, "cpu": cpu_val, "uptime_sec": uptime_sec})
+        rows.append({
+            "name": name, "cpu": cpu_val, "uptime_sec": uptime_sec,
+            "bytes_recv": bytes_recv, "bytes_sent": bytes_sent,
+        })
 
-    rows.sort(key=lambda r: r["cpu"], reverse=True)
+    rows.sort(key=lambda r: r["bytes_recv"] + r["bytes_sent"], reverse=True)
     return rows
 
 
@@ -2258,7 +2308,11 @@ def format_white_list():
     for i, r in enumerate(rows, start=1):
         alias = names_map.get(r['name'])
         label = f"{alias} (`{r['name']}`)" if alias else f"`{r['name']}`"
-        lines.append(f"{i}. {label} — CPU {r['cpu']:.1f}%, аптайм {format_uptime(r['uptime_sec'])}")
+        total = format_bytes(r["bytes_recv"] + r["bytes_sent"])
+        lines.append(
+            f"{i}. {label} — {total} (↓{format_bytes(r['bytes_recv'])} / ↑{format_bytes(r['bytes_sent'])}), "
+            f"CPU {r['cpu']:.1f}%, аптайм {format_uptime(r['uptime_sec'])}"
+        )
     return "\n".join(lines)
 
 
@@ -2299,6 +2353,7 @@ def handle_monitor(message):
             f"💾  RAM: {ram_pct:.1f}%",
             f"📀  Disk: {disk_pct:.0f}% ({disk_used_gb:.1f}/{disk_total_gb:.1f} GB)",
             render_openvpn_online_block(),
+            render_white_online_block(),
         ]
 
         samples = list(net_short_history)
