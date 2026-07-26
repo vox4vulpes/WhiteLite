@@ -735,6 +735,9 @@ def handle_menu_callback(call):
             handle_whitesub_new_create(fake)
         elif action == "whitesub_config":
             send_whitesub_config(call.message.chat.id)
+        elif action == "whitesub_config_scan":
+            fake.text = "/white -best_all -test"
+            handle_white(fake)
         elif action == "whitesub_config_check":
             pool = get_whitesub_pool()
             if not pool:
@@ -1321,6 +1324,9 @@ def format_whitesub_config_text():
 
 def whitesub_config_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton(
+        "📋 Список серверов", callback_data="cmd:whitesub_config_scan"
+    ))
     kb.add(telebot.types.InlineKeyboardButton(
         "🔍 Проверить анонимный вход", callback_data="cmd:whitesub_config_check"
     ))
