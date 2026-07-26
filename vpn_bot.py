@@ -1331,6 +1331,7 @@ def handle_whitesub_list(message):
         kb.add(telebot.types.InlineKeyboardButton(
             f"{sub['name']} - {sub_id}", callback_data=f"wsub_cfg:{sub_id}"
         ))
+    kb.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:whitesub_menu"))
     send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
     bot.send_message(message.chat.id, "Действия с подписками:", reply_markup=kb)
 
