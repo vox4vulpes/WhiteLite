@@ -21,6 +21,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./bot-data:/data
+      - /proc:/host/proc:ro
+      - /:/host-root:ro
     depends_on:
       - vpn
     restart: always

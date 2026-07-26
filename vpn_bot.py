@@ -6,12 +6,14 @@ import json
 import time
 import re
 import secrets
+import shutil
 import ssl
 import threading
 import concurrent.futures
 import ipaddress
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 import qrcode
@@ -29,6 +31,20 @@ VPN_CONTAINER_NAME = "ovpn-server"
 STATUS_LOG = "/tmp/openvpn-status.log"
 HISTORY_FILE = "/tmp/bandwidth_history.json"
 BW_LIMIT = 1_000_000_000  # 1 Gbps in bits/sec
+
+# /monitor: доступ к хостовым /proc и корневой ФС только для чтения (bind mount
+# в docker-compose.yml) - без этого бот видит только собственный контейнер,
+# а не реальный внешний интерфейс хоста или трафик самого VPN-туннеля.
+HOST_PROC = "/host/proc"
+HOST_ROOT = "/host-root"
+VPN_TUNNEL_IFACE = "tun0"  # интерфейс OpenVPN внутри контейнера ovpn-server
+BW_LIMIT_MBPS = BW_LIMIT / 1_000_000  # для баров/% в /monitor
+MSK_TZ = timezone(timedelta(hours=3))
+
+NET_SAMPLE_INTERVAL = 0.1     # сек, ~100мс - как на сервере, с которого скопирован формат
+NET_SHORT_MAXLEN = 3000       # окно для avg/peak в /monitor (~5 минут при 100мс)
+NET_DAILY_SAMPLE_INTERVAL_SEC = 38 * 60   # редкие точки для суточного графика
+NET_DAILY_WINDOW_SEC = 24 * 3600
 
 OLCRTC_IMAGE = "olcrtc-server:latest"
 OLCRTC_JITSI_INSTANCE = "meet.egovm.ru"  # проверено вручную, что открывается в белых списках
@@ -59,6 +75,7 @@ WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # legacy,
 WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, только для миграции
 WHITESUB_SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "whitesub_subscriptions.json")
 # {"active_id": "wsub-xxxx", "subscriptions": {"wsub-xxxx": {"name","token","last_text","created_at"}}}
+NET_DAILY_HISTORY_FILE = os.path.join(DATA_DIR, "net_daily_history.json")
 
 SUB_HTTPS_PORT = int(os.getenv("SUB_HTTPS_PORT", "8443"))
 SUB_CERT_DIR = os.path.join(DATA_DIR, "certs")
@@ -1809,6 +1826,297 @@ def format_bits_per_sec(bps):
     return f"{bps:.1f} Tbps"
 
 
+def format_bps_reference(bps):
+    """Формат чисел как в /monitor образце: Mbps с 2 знаками, Kbps с 1."""
+    mbps = bps / 1_000_000
+    if mbps >= 1:
+        return f"{mbps:.2f} Mbps"
+    return f"{bps / 1_000:.1f} Kbps"
+
+
+def render_bar(pct, width, use_floor=False):
+    filled = int(width * pct / 100) if use_floor else round(width * pct / 100)
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+_external_iface_cache = {"name": None}
+
+
+def detect_external_iface():
+    """Интерфейс хоста для маршрута по умолчанию (0.0.0.0/0) - тот, через который
+    реально ходит внешний трафик, независимо от того, как он называется у провайдера.
+
+    /proc/net/* - не обычный файл, а "магия", отражающая network namespace ЧИТАЮЩЕГО
+    процесса, а не хоста, даже если примонтирован хостовый /proc bind-mount'ом.
+    /proc/<pid>/net/* лишён этой магии - показывает namespace конкретного PID,
+    поэтому читаем через хостовый PID 1 (всегда в root netns хоста)."""
+    if _external_iface_cache["name"]:
+        return _external_iface_cache["name"]
+    try:
+        with open(os.path.join(HOST_PROC, "1", "net", "route")) as f:
+            next(f)  # заголовок
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "00000000":
+                    _external_iface_cache["name"] = parts[0]
+                    return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def read_iface_bytes(proc_root, iface):
+    """RX/TX байты интерфейса из <proc_root>/net/dev. proc_root может быть
+    /host/proc (сам хост) или /host/proc/<pid> (netns другого процесса/контейнера -
+    процесс, читающий файл, не обязан быть В этом namespace, он просто смотрит
+    на чужой /proc/<pid>/net/dev как на обычный файл)."""
+    try:
+        with open(os.path.join(proc_root, "net", "dev")) as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                name, rest = line.split(":", 1)
+                if name.strip() == iface:
+                    fields = rest.split()
+                    return int(fields[0]), int(fields[8])
+    except Exception:
+        pass
+    return None
+
+
+_vpn_container_pid_cache = {"pid": None, "checked_at": 0.0}
+
+
+def get_vpn_container_pid():
+    """PID ovpn-server на хосте, с недолгим кэшем - чтобы не дёргать docker inspect
+    на каждый сэмпл (раз в 100мс), но подхватывать пересоздание контейнера."""
+    now = time.time()
+    if _vpn_container_pid_cache["pid"] and now - _vpn_container_pid_cache["checked_at"] < 10:
+        return _vpn_container_pid_cache["pid"]
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", VPN_CONTAINER_NAME, "--format", "{{.State.Pid}}"],
+            capture_output=True, text=True, check=True
+        )
+        pid = int(result.stdout.strip())
+    except Exception:
+        pid = None
+    _vpn_container_pid_cache["pid"] = pid
+    _vpn_container_pid_cache["checked_at"] = now
+    return pid
+
+
+net_short_history = deque(maxlen=NET_SHORT_MAXLEN)
+_last_daily_sample_at = {"t": 0.0}
+
+
+def sample_net_interfaces():
+    now = time.time()
+    ext_iface = detect_external_iface()
+    ext = read_iface_bytes(os.path.join(HOST_PROC, "1"), ext_iface) if ext_iface else None
+
+    vpn = None
+    pid = get_vpn_container_pid()
+    if pid:
+        vpn = read_iface_bytes(os.path.join(HOST_PROC, str(pid)), VPN_TUNNEL_IFACE)
+
+    return {
+        "time": now,
+        "ext_rx": ext[0] if ext else None,
+        "ext_tx": ext[1] if ext else None,
+        "vpn_rx": vpn[0] if vpn else None,
+        "vpn_tx": vpn[1] if vpn else None,
+    }
+
+
+def maybe_record_daily_sample(sample):
+    if sample["time"] - _last_daily_sample_at["t"] < NET_DAILY_SAMPLE_INTERVAL_SEC:
+        return
+    _last_daily_sample_at["t"] = sample["time"]
+    history = load_json_file(NET_DAILY_HISTORY_FILE, [])
+    history.append(sample)
+    cutoff = sample["time"] - NET_DAILY_WINDOW_SEC
+    history = [h for h in history if h["time"] >= cutoff]
+    save_json_file(NET_DAILY_HISTORY_FILE, history)
+
+
+def net_sampler_loop():
+    while True:
+        try:
+            sample = sample_net_interfaces()
+            net_short_history.append(sample)
+            maybe_record_daily_sample(sample)
+        except Exception:
+            pass
+        time.sleep(NET_SAMPLE_INTERVAL)
+
+
+def compute_rate_stats(samples, rx_key, tx_key):
+    """samples: список по возрастанию времени с кумулятивными счётчиками байт.
+    Считает Bps по разностям соседних сэмплов, пропуская отрицательные дельты
+    (перезапуск интерфейса/контейнера - счётчик обнулился)."""
+    if len(samples) < 2:
+        return None
+    rx_rates, tx_rates = [], []
+    for prev, cur in zip(samples, samples[1:]):
+        dt = cur["time"] - prev["time"]
+        if dt <= 0:
+            continue
+        prx, crx = prev.get(rx_key), cur.get(rx_key)
+        ptx, ctx = prev.get(tx_key), cur.get(tx_key)
+        if None in (prx, crx, ptx, ctx):
+            continue
+        drx, dtx = crx - prx, ctx - ptx
+        if drx < 0 or dtx < 0:
+            continue
+        rx_rates.append(drx * 8 / dt)
+        tx_rates.append(dtx * 8 / dt)
+    if not rx_rates:
+        return None
+    return {
+        "rx_avg": sum(rx_rates) / len(rx_rates),
+        "tx_avg": sum(tx_rates) / len(tx_rates),
+        "rx_peak": max(rx_rates),
+        "tx_peak": max(tx_rates),
+    }
+
+
+def render_iface_stat_line(label, bps):
+    value_str = format_bps_reference(bps)
+    pct = (bps / 1_000_000) / BW_LIMIT_MBPS * 100
+    bar = render_bar(pct, 10)
+    return f"  {label} {value_str}\n    {bar}   {pct:.1f}%"
+
+
+def render_iface_block(title, stats, show_utilization):
+    lines = [f"  {title}:"]
+    lines.append(render_iface_stat_line("RX avg", stats["rx_avg"]))
+    lines.append(render_iface_stat_line("TX avg", stats["tx_avg"]))
+    lines.append(render_iface_stat_line("RX peak", stats["rx_peak"]))
+    lines.append(render_iface_stat_line("TX peak", stats["tx_peak"]))
+    if show_utilization:
+        util_pct = (stats["rx_avg"] + stats["tx_avg"]) / 1_000_000 / BW_LIMIT_MBPS * 100
+        bar = render_bar(util_pct, 10)
+        lines.append("  Utilization")
+        lines.append(f"    {bar}   {util_pct:.1f}%")
+    return "\n".join(lines)
+
+
+def render_daily_rx_graph():
+    history = load_json_file(NET_DAILY_HISTORY_FILE, [])
+    now = time.time()
+    cutoff = now - NET_DAILY_WINDOW_SEC
+    history = sorted(
+        (h for h in history if h["time"] >= cutoff and h.get("ext_rx") is not None),
+        key=lambda h: h["time"]
+    )
+
+    header = "📉 Скачивание (External RX, 24ч, МСК)"
+    if len(history) < 2:
+        return f"{header}\nНедостаточно данных, собираю (нужно подождать несколько часов)."
+
+    points = []
+    for prev, cur in zip(history, history[1:]):
+        dt = cur["time"] - prev["time"]
+        if dt <= 0:
+            continue
+        drx = cur["ext_rx"] - prev["ext_rx"]
+        if drx < 0:
+            continue
+        points.append((cur["time"], (drx * 8 / dt) / 1_000_000))
+
+    if not points:
+        return f"{header}\nНедостаточно данных, собираю (нужно подождать несколько часов)."
+
+    max_mbps = max(p[1] for p in points) or 1e-9
+    lines = [
+        header,
+        f"полный бар = {max_mbps:.2f} Mbps ({max_mbps / BW_LIMIT_MBPS * 100:.2f}% от 1Gbit/s)",
+        "",
+    ]
+    for ts, mbps in points:
+        bar = render_bar(mbps / max_mbps * 100, 20, use_floor=True)
+        label = datetime.fromtimestamp(ts, MSK_TZ).strftime("%H:%M")
+        value_str = format_bps_reference(mbps * 1_000_000)
+        pct = mbps / BW_LIMIT_MBPS * 100
+        lines.append(f"{label} {bar} {value_str}  {pct:.2f}%")
+
+    last_ts = points[-1][0]
+    lines.append("")
+    lines.append(f"на {datetime.fromtimestamp(last_ts, MSK_TZ).strftime('%d.%m.%Y %H:%M')} МСК")
+    return "\n".join(lines)
+
+
+def read_proc_stat_cpu_jiffies(proc_root):
+    with open(os.path.join(proc_root, "stat")) as f:
+        line = f.readline()
+    values = [int(x) for x in line.split()[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return idle, sum(values)
+
+
+def get_cpu_percent(proc_root, interval=0.3):
+    idle1, total1 = read_proc_stat_cpu_jiffies(proc_root)
+    time.sleep(interval)
+    idle2, total2 = read_proc_stat_cpu_jiffies(proc_root)
+    dtotal = total2 - total1
+    didle = idle2 - idle1
+    if dtotal <= 0:
+        return 0.0
+    return max(0.0, min(100.0, (1 - didle / dtotal) * 100))
+
+
+def get_load_average_1m(proc_root):
+    with open(os.path.join(proc_root, "loadavg")) as f:
+        return float(f.read().split()[0])
+
+
+def get_cpu_count(proc_root):
+    count = 0
+    with open(os.path.join(proc_root, "cpuinfo")) as f:
+        for line in f:
+            if line.startswith("processor"):
+                count += 1
+    return count or 1
+
+
+def get_ram_percent(proc_root):
+    info = {}
+    with open(os.path.join(proc_root, "meminfo")) as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            info[key.strip()] = int(rest.strip().split()[0])
+    total = info.get("MemTotal", 0)
+    if total <= 0:
+        return 0.0
+    available = info.get("MemAvailable", total)
+    return (total - available) / total * 100
+
+
+def get_disk_usage(root_path):
+    total, used, _ = shutil.disk_usage(root_path)
+    pct = used / total * 100 if total else 0.0
+    return pct, used / (1024 ** 3), total / (1024 ** 3)
+
+
+def render_openvpn_online_block():
+    try:
+        clients = parse_status()
+    except Exception:
+        clients = []
+    clients.sort(key=lambda c: c["bytes_recv"] + c["bytes_sent"], reverse=True)
+    names_map = get_client_names()
+    lines = [f"🛡️  OpenVPN: {len(clients)}"]
+    for c in clients:
+        alias = names_map.get(c["name"])
+        label = f"{alias}  ({c['name']})" if alias else c["name"]
+        recv_mb = c["bytes_recv"] / (1024 ** 2)
+        sent_mb = c["bytes_sent"] / (1024 ** 2)
+        lines.append(f"  • {label}  ↓{recv_mb:.1f}/↑{sent_mb:.1f} MB")
+    return "\n".join(lines)
+
+
 def list_openvpn_clients():
     """Все клиентские сертификаты, когда-либо выданные ботом (/new).
     Сервер сам себе тоже выдаёт сертификат (CN=IP) - он не начинается с "user_",
@@ -1973,49 +2281,56 @@ def handle_list(message):
 
 @bot.message_handler(commands=['monitor'])
 def handle_monitor(message):
+    if not is_admin(message):
+        bot.reply_to(message, "⛔ Команда доступна только администратору.")
+        return
+
     msg = bot.reply_to(message, "⏳ Собираю данные мониторинга...")
 
     try:
-        clients = parse_status()
-        now = time.time()
-        total_recv = sum(c["bytes_recv"] for c in clients)
-        total_sent = sum(c["bytes_sent"] for c in clients)
+        cpu_pct = get_cpu_percent(HOST_PROC)
+        load1 = get_load_average_1m(HOST_PROC)
+        cores = get_cpu_count(HOST_PROC)
+        ram_pct = get_ram_percent(HOST_PROC)
+        disk_pct, disk_used_gb, disk_total_gb = get_disk_usage(HOST_ROOT)
 
-        history = load_history()
-        history.append({
-            "time": now,
-            "total_bytes": total_recv + total_sent
-        })
-        one_hour_ago = now - 3600
-        history = [h for h in history if h["time"] >= one_hour_ago]
-        save_history(history)
+        lines = [
+            f"🖥  CPU: {cpu_pct:.1f}% (load: {load1:.1f}/{cores})",
+            f"💾  RAM: {ram_pct:.1f}%",
+            f"📀  Disk: {disk_pct:.0f}% ({disk_used_gb:.1f}/{disk_total_gb:.1f} GB)",
+            render_openvpn_online_block(),
+        ]
 
-        bw_text = "Нет данных за последний час (нужно два замера)"
-        pct_text = ""
-        if len(history) >= 2:
-            first = history[0]
-            last = history[-1]
-            elapsed = last["time"] - first["time"]
-            if elapsed > 0:
-                bits = (last["total_bytes"] - first["total_bytes"]) * 8
-                bps = bits / elapsed
-                bw_text = format_bits_per_sec(bps)
-                pct = (bps / BW_LIMIT) * 100
-                pct_text = f" ({pct:.1f}% от 1 Гбит/с)"
+        samples = list(net_short_history)
+        ext_stats = compute_rate_stats(samples, "ext_rx", "ext_tx")
+        vpn_stats = compute_rate_stats(samples, "vpn_rx", "vpn_tx")
 
-        lines = [f"📊 *Мониторинг VPN*\n"]
-        lines.append(f"👥 *Клиенты:* {len(clients)}")
-        if clients:
-            lines.append("")
-            for c in clients:
-                total = format_bytes(c["bytes_recv"] + c["bytes_sent"])
-                lines.append(f"  └ `{c['name']}` — {total}")
         lines.append("")
-        lines.append(f"📥 Принято: {format_bytes(total_recv)}")
-        lines.append(f"📤 Отправлено: {format_bytes(total_sent)}")
-        lines.append(f"📈 Средняя нагрузка за час: {bw_text}{pct_text}")
+        if samples:
+            elapsed = samples[-1]["time"] - samples[0]["time"]
+            lines.append("📡  Bandwidth (max 1 Gbit/s)")
+            lines.append(
+                f"Sampled {len(samples)}x over {elapsed:.0f}s (real Δt, ~{NET_SAMPLE_INTERVAL * 1000:.0f}ms nominal)"
+            )
+            lines.append("")
+        if ext_stats:
+            lines.append(render_iface_block("External", ext_stats, show_utilization=True))
+        else:
+            lines.append("  External: собираю данные...")
+        if vpn_stats:
+            lines.append("")
+            lines.append(render_iface_block("VPN Bridge", vpn_stats, show_utilization=False))
 
-        bot.edit_message_text("\n".join(lines), message.chat.id, msg.message_id, parse_mode="Markdown")
+        lines.append("")
+        lines.append("─" * 30)
+        lines.append(f"⏱️  {datetime.now(MSK_TZ).strftime('%H:%M:%S %d.%m.%Y')}")
+
+        text = "```\n" + "\n".join(lines) + "\n```"
+        bot.delete_message(message.chat.id, msg.message_id)
+        bot.send_message(message.chat.id, text, parse_mode="Markdown")
+        bot.send_message(
+            message.chat.id, "```\n" + render_daily_rx_graph() + "\n```", parse_mode="Markdown"
+        )
 
     except Exception as e:
         bot.edit_message_text(f"❌ Ошибка: {str(e)}", message.chat.id, msg.message_id)
@@ -2191,6 +2506,9 @@ if __name__ == "__main__":
 
     sub_server_thread = threading.Thread(target=start_subscription_server, daemon=True)
     sub_server_thread.start()
+
+    net_sampler_thread = threading.Thread(target=net_sampler_loop, daemon=True)
+    net_sampler_thread.start()
 
     print("Бот запущен...")
     bot.infinity_polling()
