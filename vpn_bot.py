@@ -73,6 +73,7 @@ WHITE_CONFIGS_FILE = os.path.join(DATA_DIR, "white_configs.json")  # {container_
 DEFAULT_JITSI_FILE = os.path.join(DATA_DIR, "default_jitsi.json")  # {"host": "..."}
 WHITESUB_POOL_FILE = os.path.join(DATA_DIR, "whitesub_pool.json")  # {"hosts": [...], "updated_at": ts}
 JITSI_DENYLIST_FILE = os.path.join(DATA_DIR, "jitsi_denylist.json")  # {"hosts": [...]}
+JITSI_SCORES_FILE = os.path.join(DATA_DIR, "jitsi_scores.json")  # {host: manual_score}
 WHITESUB_TOKEN_FILE = os.path.join(DATA_DIR, "whitesub_token.json")  # legacy, только для миграции
 WHITESUB_LAST_TEXT_FILE = os.path.join(DATA_DIR, "whitesub_last.txt")  # legacy, только для миграции
 WHITESUB_META_FILE = os.path.join(DATA_DIR, "whitesub_meta.json")  # legacy, только для миграции
@@ -118,6 +119,10 @@ pending_white_config = {}
 # шага записи (в минутах) по reply. Разовое действие - настройка живёт до
 # следующего изменения, а не сбрасывается сама.
 pending_net_graph_interval = {}
+
+# message_id сообщения со "Списком серверов" (/white -best_all[-test]) -> True,
+# для ручной корректировки счёта по reply (`домен +1` / `домен -1`).
+pending_jitsi_score_reply = {}
 
 
 def is_admin(message):
@@ -418,6 +423,41 @@ def add_to_jitsi_denylist(host):
         save_json_file(JITSI_DENYLIST_FILE, {"hosts": hosts})
 
 
+def get_jitsi_scores():
+    """Ручные оценки серверов {host: score} - админ сам решает, что реально
+    работает (отвечая на "Список серверов" строкой вида `домен +1`/`домен -1`),
+    в отличие от автоматических латентность/скорость метрик. Персистентно
+    добавляется к автосчёту в compute_combined_scores и влияет на сортировку
+    во всех местах, где он используется (в т.ч. на выбор при реальном деплое)."""
+    return load_json_file(JITSI_SCORES_FILE, {})
+
+
+def adjust_jitsi_score(host, delta):
+    scores = get_jitsi_scores()
+    scores[host] = scores.get(host, 0) + delta
+    save_json_file(JITSI_SCORES_FILE, scores)
+    return scores[host]
+
+
+def handle_jitsi_score_reply(message):
+    text = message.text.strip()
+    m = re.match(r'^(.*\S)\s+([+-]\d+)$', text)
+    if not m:
+        bot.reply_to(
+            message, "⛔ Формат: `домен +1` или `домен -1` (например `meet.example.org -2`).",
+            parse_mode="Markdown"
+        )
+        return
+
+    host, error = sanitize_jitsi_host(m.group(1))
+    if error:
+        bot.reply_to(message, error, parse_mode="Markdown")
+        return
+
+    new_score = adjust_jitsi_score(host, int(m.group(2)))
+    bot.reply_to(message, f"✅ `{host}`: ручная оценка теперь {new_score:+d}.", parse_mode="Markdown")
+
+
 def get_default_jitsi_instance():
     return load_json_file(DEFAULT_JITSI_FILE, {}).get("host", OLCRTC_JITSI_INSTANCE)
 
@@ -446,19 +486,22 @@ def sanitize_jitsi_host(raw):
 
 
 def send_long_message(chat_id, text, parse_mode=None):
-    """Шлёт текст одним сообщением, а если он длиннее лимита телеграма - режет по строкам."""
+    """Шлёт текст одним сообщением, а если он длиннее лимита телеграма - режет по строкам.
+    Возвращает список реально отправленных Message (обычно один, если текст короткий)."""
+    sent = []
     lines = text.split("\n")
     chunk = ""
     for line in lines:
         candidate = f"{chunk}\n{line}" if chunk else line
         if len(candidate) > TELEGRAM_MSG_LIMIT:
             if chunk:
-                bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+                sent.append(bot.send_message(chat_id, chunk, parse_mode=parse_mode))
             chunk = line
         else:
             chunk = candidate
     if chunk:
-        bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+        sent.append(bot.send_message(chat_id, chunk, parse_mode=parse_mode))
+    return sent
 
 
 def is_bare_ip(host):
@@ -524,127 +567,6 @@ def filter_by_anonymous_login(hosts):
     return good
 
 
-TURN_CHECKER_IMAGE = "turn-checker:latest"
-JITSI_TURN_DEBUG_WAIT_SEC = 5      # сколько ждать появления TURN credentials в debug-логе
-JITSI_TURN_ALLOCATE_TIMEOUT = 8    # сек на сам TURN allocate-запрос
-JITSI_TURN_CHECK_WORKERS = 8       # конкурентность, без фанатизма
-
-
-def parse_turn_service_from_debug_log(log_text):
-    """Достаёт host/port/username/password TURN-сервиса из debug-лога olcrtc
-    (XEP-0215 extdisco ответ). Порядок атрибутов в XML не гарантирован (разные
-    Jitsi-серверы шлют их по-разному - port может стоять и до, и после
-    transport), а пароль сам может содержать '/' (base64) - поэтому берём
-    тег по границе '>' (её в атрибутах-значениях не бывает), а не жадно до
-    первого '/', и разбираем атрибуты как словарь, не полагаясь на порядок."""
-    m = re.search(r"<service type='turn'[^>]*/>", log_text)
-    if not m:
-        return None
-    attrs = dict(re.findall(r"(\w+)='([^']*)'", m.group(0)))
-    if attrs.get("transport") != "udp":
-        return None
-    host, port = attrs.get("host"), attrs.get("port")
-    username, password = attrs.get("username"), attrs.get("password")
-    if not all([host, port, username, password]):
-        return None
-    return host, port, username, password
-
-
-def is_private_relay_ip(ip_str):
-    try:
-        return ipaddress.ip_address(ip_str).is_private
-    except ValueError:
-        return False
-
-
-def check_jitsi_turn_relay(host):
-    """Проверяет, что TURN-сервер этого Jitsi-хоста отдаёт публичный relay-адрес,
-    а не приватный (частый баг конфигурации coturn - см. случай meet.geotec.ru,
-    у которого relay уходит на 10.x.x.x, недостижимый снаружи; клиент внешне
-    может даже "подключиться", но тут же рвётся без единого байта трафика).
-
-    check_jitsi_anonymous_login это не ловит - тот сидит в комнате один, без
-    реального пира, и не доходит до ICE/TURN вообще. Здесь credentials на TURN
-    достаём из debug-лога olcrtc (XMPP extdisco, не требует пира), а сам relay-
-    адрес получаем настоящим TURN Allocate через turnutils_uclient (из пакета
-    coturn) - тоже без необходимости в живом собеседнике.
-
-    Возвращает (ok: bool, detail: str)."""
-    container_name = f"olcrtc-turnprobe-{uuid.uuid4().hex[:8]}"
-    room_id = f"https://{host}/probe-{uuid.uuid4().hex[:8]}"
-    enc_key = os.urandom(32).hex()
-
-    logs = ""
-    try:
-        subprocess.run(
-            [
-                "docker", "run", "-d", "--network", "host",
-                "--name", container_name,
-                "-e", f"ROOM_ID={room_id}",
-                "-e", f"ENC_KEY={enc_key}",
-                "-e", "PROVIDER=jitsi",
-                "-e", "TRANSPORT=datachannel",
-                "-e", "DEBUG=true",
-                OLCRTC_IMAGE,
-            ],
-            capture_output=True, text=True, timeout=10, check=True,
-        )
-        deadline = time.monotonic() + JITSI_TURN_DEBUG_WAIT_SEC
-        while time.monotonic() < deadline:
-            logs_result = subprocess.run(
-                ["docker", "logs", container_name], capture_output=True, text=True, timeout=5
-            )
-            logs = logs_result.stdout + logs_result.stderr  # olcrtc пишет лог в stderr
-            if "type='turn'" in logs:
-                break
-            time.sleep(0.5)
-    except Exception as e:
-        return False, f"не удалось получить TURN credentials: {e}"
-    finally:
-        subprocess.run(["docker", "kill", container_name], capture_output=True, text=True)
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
-
-    turn = parse_turn_service_from_debug_log(logs)
-    if not turn:
-        return False, "сервер не отдал TURN-сервис (extdisco)"
-
-    turn_host, turn_port, username, password = turn
-    try:
-        result = subprocess.run(
-            [
-                "docker", "run", "--rm", "--network", "host",
-                TURN_CHECKER_IMAGE,
-                "-u", username, "-w", password, "-p", turn_port, "-y", "-v", "-n", "1",
-                turn_host,
-            ],
-            capture_output=True, text=True, timeout=JITSI_TURN_ALLOCATE_TIMEOUT,
-        )
-        output = result.stdout + result.stderr
-    except Exception as e:
-        return False, f"TURN allocate не выполнился: {e}"
-
-    m = re.search(r"Received relay addr:\s*([\d.]+):", output)
-    if not m:
-        return False, "TURN allocate не вернул relay-адрес"
-
-    relay_ip = m.group(1)
-    if is_private_relay_ip(relay_ip):
-        return False, f"relay-адрес {relay_ip} приватный - недостижим снаружи"
-    return True, f"relay: {relay_ip}"
-
-
-def check_turn_relay_parallel(hosts):
-    """Возвращает {host: (ok, detail)} для всех hosts, параллельно."""
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_TURN_CHECK_WORKERS) as pool:
-        futures = {pool.submit(check_jitsi_turn_relay, h): h for h in hosts}
-        for future in concurrent.futures.as_completed(futures):
-            host = futures[future]
-            try:
-                results[host] = future.result()
-            except Exception as e:
-                results[host] = (False, f"ошибка проверки: {e}")
-    return results
 
 
 def fetch_jitsi_candidates(check_anonymous_login=True):
@@ -898,7 +820,8 @@ def handle_start(message):
         f"  по умолчанию `{get_default_jitsi_instance()}`, можно указать свой: `/white meet.small-dm.ru`\n"
         "*/white* `-best_ms` — просканировать публичный список Jitsi-серверов и поднять туннель на сервере с наименьшей задержкой\n"
         "*/white* `-best_mb` — то же самое, но выбор по реальной скорости скачивания (Mbps, тест на 20+ МБ), а не по задержке — дольше, но точнее\n"
-        "*/white* `-best_all` — проводит оба теста и считает комбинированный балл по местам в каждом (1 место = -1 балл, N место = -N баллов, старт у всех N+1; место по скорости считается с двойным весом)\n"
+        "*/white* `-best_all` — проводит оба теста и считает комбинированный балл по местам в каждом (1 место = -1 балл, N место = -N баллов, старт у всех N+1; место по скорости считается с двойным весом). К счёту прибавляется твоя ручная оценка (см. ниже) и влияет на сортировку\n"
+        "  ответь на список результатов строкой `домен +1` / `домен -1`, чтобы вручную скорректировать счёт конкретного домена — сохраняется навсегда и учитывается во всех будущих сканах\n"
         "  добавь `-test` к любому из `-best_ms` / `-best_mb` / `-best_all` (например `/white -best_ms -test`), чтобы только увидеть результаты скана без подъёма туннеля\n"
         "  добавь `-checkoff`, чтобы отключить реальную проверку анонимного XMPP-логина (быстрее, но без гарантии, что домен реально годится для туннеля)\n"
         "*/white* `-default <домен>` — задать домен по умолчанию для обычного `/white` (например `/white -default meet.small-dm.ru`)\n"
@@ -1257,7 +1180,9 @@ def compute_combined_scores(hosts, latency_results, speed_results):
     За каждый тест вычитается место хоста в этом тесте (1 место = -1 балл, N место = -N баллов),
     место в speed-тесте умножается на BEST_ALL_SPEED_WEIGHT.
     Хост, не ответивший в тесте, получает худшее возможное место (len(hosts)+1) в этом тесте.
-    Возвращает список (host, score, latency_rank, latency_sec, speed_rank, mbps),
+    К автосчёту прибавляется персистентная ручная оценка (get_jitsi_scores) - админ
+    сам вручную корректирует счёт по факту реальных подключений (см. /white -best_all -test).
+    Возвращает список (host, score, latency_rank, latency_sec, speed_rank, mbps, manual_score),
     отсортированный по score по убыванию (выше = лучше)."""
     n = len(hosts)
     worst_rank = n + 1
@@ -1267,32 +1192,32 @@ def compute_combined_scores(hosts, latency_results, speed_results):
     latency_value = dict(latency_results)
     speed_rank = {host: i for i, (host, _) in enumerate(speed_results, start=1)}
     speed_value = dict(speed_results)
+    manual_scores = get_jitsi_scores()
 
     combined = []
     for host in hosts:
         lr = latency_rank.get(host, worst_rank)
         sr = speed_rank.get(host, worst_rank)
-        score = initial_score - lr - (BEST_ALL_SPEED_WEIGHT * sr)
+        manual = manual_scores.get(host, 0)
+        score = initial_score - lr - (BEST_ALL_SPEED_WEIGHT * sr) + manual
         combined.append((
             host, score,
             latency_rank.get(host), latency_value.get(host),
             speed_rank.get(host), speed_value.get(host),
+            manual,
         ))
 
     combined.sort(key=lambda x: x[1], reverse=True)
     return combined
 
 
-def format_combined_results_list(combined, turn_results=None):
+def format_combined_results_list(combined):
     lines = []
-    for i, (host, score, lr, lv, sr, sv) in enumerate(combined, start=1):
+    for i, (host, score, lr, lv, sr, sv, manual) in enumerate(combined, start=1):
         ms_part = f"{lv * 1000:.0f} мс (#{lr})" if lr is not None else "нет ответа"
         mbps_part = f"{sv:.1f} Mbps (#{sr})" if sr is not None else "нет ответа"
-        line = f"{i}. `{host}` — счёт {score}: {ms_part} / {mbps_part}"
-        if turn_results and host in turn_results:
-            ok, detail = turn_results[host]
-            line += f" · TURN {'✅' if ok else '❌'} ({detail})"
-        lines.append(line)
+        manual_part = f" · оценка {manual:+d}" if manual else ""
+        lines.append(f"{i}. `{host}` — счёт {score}{manual_part}: {ms_part} / {mbps_part}")
     return "\n".join(lines)
 
 
@@ -1433,30 +1358,10 @@ def handle_white_best_all(message, dry_run=False, check_anonymous_login=True):
         return
 
     combined = compute_combined_scores(hosts, latency_results, speed_results)
-    best_host, best_score, best_lr, best_lv, best_sr, best_sv = combined[0]
+    best_host, best_score, best_lr, best_lv, best_sr, best_sv, _best_manual = combined[0]
 
     ms_part = f"{best_lv * 1000:.0f} мс (#{best_lr})" if best_lr is not None else "нет ответа"
     mbps_part = f"{best_sv:.1f} Mbps (#{best_sr})" if best_sr is not None else "нет ответа"
-
-    turn_results = None
-    if dry_run:
-        # Только аннотация, без авто-denylist: проверка изолированным TURN Allocate
-        # ловит реально сломанные серверы (see meet.geotec.ru - приватный relay-IP,
-        # подтверждено логом реального отказа), но даёт и ложные срабатывания на
-        # серверах, которые по факту работают (zgn-y-vc01.zignotch.com - реально
-        # использовался с настоящим трафиком, но тоже засветил приватный IP в
-        # этом тесте) - похоже, у части серверов есть другой рабочий путь,
-        # которого наш изолированный allocate не видит. Решение остаётся за
-        # админом, не автоматизируем исключение по одному этому сигналу.
-        checked_hosts = [c[0] for c in combined if c[2] is not None or c[4] is not None]
-        try:
-            bot.edit_message_text(
-                f"🧮 Проверяю TURN-relay ({len(checked_hosts)} серверов)...",
-                message.chat.id, msg.message_id
-            )
-            turn_results = check_turn_relay_parallel(checked_hosts)
-        except Exception:
-            turn_results = None
 
     bot.edit_message_text(
         f"✅ Просканировано {total}\n"
@@ -1467,12 +1372,16 @@ def handle_white_best_all(message, dry_run=False, check_anonymous_login=True):
         message.chat.id, msg.message_id, parse_mode="Markdown"
     )
 
-    send_long_message(
+    sent_list_messages = send_long_message(
         message.chat.id,
         "📋 *Полный список (комбинированный балл):*\n"
-        + format_combined_results_list(combined, turn_results=turn_results),
+        + format_combined_results_list(combined)
+        + "\n\nОтветь на это сообщение строкой `домен +1` / `домен -1`, "
+          "чтобы вручную скорректировать его счёт (сохранится навсегда).",
         parse_mode="Markdown"
     )
+    for sent in sent_list_messages:
+        pending_jitsi_score_reply[sent.message_id] = True
 
     if not dry_run:
         deploy_white_tunnel(message.chat.id, msg.message_id, best_host)
@@ -2749,6 +2658,10 @@ def handle_text(message):
 
             if reply_id in pending_net_graph_interval:
                 handle_net_graph_interval_reply(message)
+                return
+
+            if reply_id in pending_jitsi_score_reply:
+                handle_jitsi_score_reply(message)
                 return
 
             if reply_id in pending_rename:
