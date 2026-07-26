@@ -1319,7 +1319,7 @@ def handle_whitesub_list(message):
 
     active_id = store.get("active_id")
     lines = ["📚 Подписки:"]
-    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb = telebot.types.InlineKeyboardMarkup(row_width=1)
     for sub_id, sub in store["subscriptions"].items():
         mark = "★" if sub_id == active_id else "·"
         empty = " (пусто)" if not sub.get("last_text") else ""
@@ -1328,14 +1328,9 @@ def handle_whitesub_list(message):
         if link:
             lines.append(f"    `{link}`")
 
-        row = [telebot.types.InlineKeyboardButton(
-            f"⚙️ Конфигурация: {sub['name']}", callback_data=f"wsub_cfg:{sub_id}"
-        )]
-        if sub_id != active_id:
-            row.append(telebot.types.InlineKeyboardButton(
-                "➡️ Сделать активной", callback_data=f"wsub_use:{sub_id}"
-            ))
-        kb.add(*row)
+        kb.add(telebot.types.InlineKeyboardButton(
+            f"{sub['name']} - {sub_id}", callback_data=f"wsub_cfg:{sub_id}"
+        ))
     send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
     bot.send_message(message.chat.id, "Действия с подписками:", reply_markup=kb)
 
