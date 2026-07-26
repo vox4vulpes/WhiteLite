@@ -735,6 +735,19 @@ def handle_menu_callback(call):
             handle_whitesub_new_create(fake)
         elif action == "whitesub_config":
             send_whitesub_config(call.message.chat.id)
+        elif action == "whitesub_config_check":
+            pool = get_whitesub_pool()
+            if not pool:
+                bot.send_message(call.message.chat.id, "Конфигурация пуста, нечего проверять.")
+                return
+            status = bot.send_message(
+                call.message.chat.id,
+                f"⏳ Проверяю анонимный вход для {len(pool)} серверов "
+                f"(до {JITSI_ANON_CHECK_TIMEOUT}с на сервер, параллельно)..."
+            )
+            recheck_whitesub_pool_anonymous_login()
+            bot.delete_message(call.message.chat.id, status.message_id)
+            send_whitesub_config(call.message.chat.id)
         elif action == "whitesub_config_reset":
             bot.edit_message_text(
                 "⚠️ Точно стереть текущую конфигурацию серверов и пересканировать с нуля?",
@@ -1308,9 +1321,34 @@ def format_whitesub_config_text():
 
 def whitesub_config_keyboard():
     kb = telebot.types.InlineKeyboardMarkup(row_width=1)
+    kb.add(telebot.types.InlineKeyboardButton(
+        "🔍 Проверить анонимный вход", callback_data="cmd:whitesub_config_check"
+    ))
     kb.add(telebot.types.InlineKeyboardButton("🔄 Настроить с 0", callback_data="cmd:whitesub_config_reset"))
     kb.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="cmd:whitesub_new_menu"))
     return kb
+
+
+def recheck_whitesub_pool_anonymous_login():
+    """Перепроверяет anon-login для всех хостов пула параллельно и обновляет
+    их отметку checks на месте (не трогает denylist - это только пометка
+    в самой конфигурации, а не решение о её исключении из будущих сканов)."""
+    pool = get_whitesub_pool()
+    if not pool:
+        return pool
+
+    hosts = [entry["host"] for entry in pool]
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JITSI_ANON_CHECK_WORKERS) as executor:
+        futures = {executor.submit(check_jitsi_anonymous_login, h): h for h in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            host = futures[future]
+            results[host] = future.result()
+
+    for entry in pool:
+        entry["checks"] = "ok" if results.get(entry["host"]) else "fail"
+    save_whitesub_pool(pool)
+    return pool
 
 
 def whitesub_config_reset_confirm_keyboard():
